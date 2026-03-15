@@ -771,32 +771,31 @@ handle_message_create(FluxerData *fd, JsonObject *d)
     gint ch_type = json_object_has_member(d, "channel_type")
         ? (gint)json_object_get_int_member(d, "channel_type") : -1;
 
-    /* Personal notes channel (type 999, channel_id == self_user_id):
-     * messages are authored by self — deliver them instead of filtering */
+    /* Personal notes (type 999): authored by self, deliver as IM */
     if (ch_type == 999) {
         serv_got_im(fd->gc, fd->self_username, content,
                     PURPLE_MESSAGE_RECV, time(NULL));
         return;
     }
 
-    /* Ignore our own messages in all other channel types */
-    if (g_strcmp0(author_id, fd->self_user_id) == 0) return;
-
+    gboolean is_self = (g_strcmp0(author_id, fd->self_user_id) == 0);
     gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
     time_t ts = time(NULL);
 
     if (guild_id == NULL) {
-        /* DM — deliver as IM */
-        serv_got_im(fd->gc, username, content,
-                    PURPLE_MESSAGE_RECV, ts);
+        /* DM — libpurple echoes outgoing IMs automatically, drop self */
+        if (is_self) return;
+        serv_got_im(fd->gc, username, content, PURPLE_MESSAGE_RECV, ts);
     } else {
-        /* Guild channel — deliver to chat */
+        /* Guild channel — pass self-echo through with SEND flag so sent
+         * messages appear in the conversation window */
         gpointer chat_id_ptr =
             g_hash_table_lookup(fd->chat_id_map, channel_id);
         if (chat_id_ptr) {
             gint chat_id = GPOINTER_TO_INT(chat_id_ptr);
-            serv_got_chat_in(fd->gc, chat_id, username,
-                             PURPLE_MESSAGE_RECV, content, ts);
+            PurpleMessageFlags flags =
+                is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
+            serv_got_chat_in(fd->gc, chat_id, username, flags, content, ts);
         }
     }
 }
