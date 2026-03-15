@@ -21,7 +21,7 @@ USER_PLUGINDIR   = $(HOME)/.purple/plugins
 # 'make install-icons' installs the official Fluxer icons system-wide (requires sudo).
 ICON_DIR = /usr/share/pixmaps/pidgin/protocols
 
-.PHONY: all clean install install-user install-icons
+.PHONY: all clean install install-user uninstall uninstall-user install-icons uninstall-icons
 
 all: $(PLUGIN_SO)
 
@@ -39,11 +39,21 @@ install-user: $(PLUGIN_SO)
 	install -d $(USER_PLUGINDIR)
 	install -m 644 $(PLUGIN_SO) $(USER_PLUGINDIR)
 
+uninstall:
+	rm -f $(SYSTEM_PLUGINDIR)/$(PLUGIN_SO)
+
+uninstall-user:
+	rm -f $(USER_PLUGINDIR)/$(PLUGIN_SO)
+
 # Pidgin 2.x has no user-local icon path — system install is unavoidable.
 install-icons:
 	sudo install -Dm644 icons/fluxer16.png $(ICON_DIR)/16/fluxer.png
 	sudo install -Dm644 icons/fluxer22.png $(ICON_DIR)/22/fluxer.png
 	sudo install -Dm644 icons/fluxer48.png $(ICON_DIR)/48/fluxer.png
+
+uninstall-icons:
+	sudo rm -f $(ICON_DIR)/16/fluxer.png $(ICON_DIR)/22/fluxer.png \
+	           $(ICON_DIR)/48/fluxer.png
 
 clean:
 	rm -f $(OBJS) $(PLUGIN_SO)

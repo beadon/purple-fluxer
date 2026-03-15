@@ -133,6 +133,8 @@ typedef struct {
     GHashTable *seeded_channels;   /* channel_id (str) -> 1: session dedup for blist */
     GHashTable *user_names;        /* user_id (str)    -> username (str) */
     GHashTable *oldest_msg_id;     /* channel_id (str) -> oldest message snowflake (str) */
+    GHashTable *read_states;       /* channel_id (str) -> last_read_msg_id (str): from READY */
+    GHashTable *channel_last_msg;  /* channel_id (str) -> last_message_id (str): newest in channel */
     GHashTable *guild_members;     /* guild_id (str)   -> GList* of gchar* usernames */
     gint        next_chat_id;
 
@@ -187,6 +189,8 @@ fluxer_data_new(PurpleConnection *gc)
     fd->seeded_channels  = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     fd->user_names       = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->oldest_msg_id    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->read_states      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->channel_last_msg = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->guild_members    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                free_string_list);
     fd->next_chat_id     = 1;
@@ -220,6 +224,8 @@ fluxer_data_free(FluxerData *fd)
     g_hash_table_destroy(fd->seeded_channels);
     g_hash_table_destroy(fd->user_names);
     g_hash_table_destroy(fd->oldest_msg_id);
+    g_hash_table_destroy(fd->read_states);
+    g_hash_table_destroy(fd->channel_last_msg);
     g_hash_table_destroy(fd->guild_members);
 
     g_free(fd->api_base);
@@ -667,6 +673,50 @@ fluxer_gateway_send_resume(FluxerData *fd)
 
 /* ─── Dispatch event handlers ─────────────────────────────────────────── */
 
+/* Compare two Discord snowflake strings numerically.
+ * Snowflakes are monotonically-increasing decimal integers. Since they are
+ * always the same width (17-19 digits), a length-first lexicographic
+ * comparison gives the correct numeric ordering without bignum arithmetic.
+ * Returns TRUE if a > b. NULL or empty string is treated as 0. */
+static gboolean
+fluxer_snowflake_gt(const gchar *a, const gchar *b)
+{
+    if (!a || !*a) return FALSE;
+    if (!b || !*b) return TRUE;   /* anything > nothing (channel has messages, never read) */
+    gsize la = strlen(a), lb = strlen(b);
+    if (la != lb) return la > lb;
+    return strcmp(a, b) > 0;
+}
+
+/* Walk all PurpleChat blist nodes for this account and set the 'unseen-count'
+ * node-data key on channels that have messages newer than the user's last-read
+ * snowflake.  This stores the state for use in fluxer_join_chat.
+ *
+ * Note: Pidgin only bolds blist entries for chats that have an open
+ * PurpleConversation — there is no public API to bold a closed chat entry
+ * without opening a window.  Full blist bolding requires upstream Pidgin
+ * changes (tracked in the Known Limitations section of the README). */
+static void
+fluxer_blist_apply_unread(FluxerData *fd)
+{
+    PurpleBlistNode *gnode, *node;
+    for (gnode = purple_blist_get_root(); gnode; gnode = gnode->next) {
+        if (!PURPLE_BLIST_NODE_IS_GROUP(gnode)) continue;
+        for (node = gnode->child; node; node = node->next) {
+            if (!PURPLE_BLIST_NODE_IS_CHAT(node)) continue;
+            PurpleChat *chat = (PurpleChat *)node;
+            if (purple_chat_get_account(chat) != fd->account) continue;
+            const gchar *ch_id = g_hash_table_lookup(
+                purple_chat_get_components(chat), "channel_id");
+            if (!ch_id) continue;
+            const gchar *last_msg  = g_hash_table_lookup(fd->channel_last_msg, ch_id);
+            const gchar *last_read = g_hash_table_lookup(fd->read_states, ch_id);
+            gint count = fluxer_snowflake_gt(last_msg, last_read) ? 1 : 0;
+            purple_blist_node_set_int(node, "unseen-count", count);
+        }
+    }
+}
+
 static void
 handle_ready(FluxerData *fd, JsonObject *d)
 {
@@ -755,6 +805,28 @@ handle_ready(FluxerData *fd, JsonObject *d)
         }
         purple_debug_info("fluxer", "READY: processed %u guilds\n", ng);
     }
+
+    /* Parse read_states: records the last message the user has read per channel.
+     * Structure: [ { "id": channel_id, "last_message_id": snowflake|null, ... } ] */
+    if (json_object_has_member(d, "read_states")) {
+        JsonArray *rs = json_object_get_array_member(d, "read_states");
+        guint nrs = json_array_get_length(rs);
+        for (guint i = 0; i < nrs; i++) {
+            JsonObject *entry  = json_array_get_object_element(rs, i);
+            const gchar *ch_id = json_object_get_string_member(entry, "id");
+            JsonNode *lm_node  = json_object_has_member(entry, "last_message_id")
+                ? json_object_get_member(entry, "last_message_id") : NULL;
+            const gchar *last_read = (lm_node && !json_node_is_null(lm_node))
+                ? json_node_get_string(lm_node) : NULL;
+            if (ch_id && last_read)
+                g_hash_table_insert(fd->read_states,
+                                    g_strdup(ch_id), g_strdup(last_read));
+        }
+        purple_debug_info("fluxer", "READY: processed %u read_states\n", nrs);
+    }
+
+    /* Mark blist chat nodes as unread where channel has newer messages */
+    fluxer_blist_apply_unread(fd);
 
     purple_connection_set_state(fd->gc, PURPLE_CONNECTED);
     purple_connection_update_progress(fd->gc, "Connected", 3, 3);
@@ -1475,6 +1547,18 @@ handle_guild_create(FluxerData *fd, JsonObject *d)
         if (ch_type == 0 || ch_type == 5) {  /* text / announcement */
             g_hash_table_insert(fd->channel_to_guild,
                                 g_strdup(ch_id), g_strdup(guild_id));
+
+            /* Capture last_message_id for unread detection */
+            if (json_object_has_member(ch, "last_message_id")) {
+                JsonNode *lm = json_object_get_member(ch, "last_message_id");
+                if (!json_node_is_null(lm)) {
+                    const gchar *lmid = json_node_get_string(lm);
+                    if (lmid)
+                        g_hash_table_insert(fd->channel_last_msg,
+                                            g_strdup(ch_id), g_strdup(lmid));
+                }
+            }
+
             if (ch_name) {
                 g_hash_table_insert(fd->channel_names,
                                     g_strdup(ch_id), g_strdup(ch_name));
@@ -1968,6 +2052,52 @@ fluxer_use_token(FluxerData *fd)
     fluxer_ws_connect(fd);
 }
 
+/* ─── CAPTCHA / browser-token challenge ────────────────────────────────── *
+ *
+ * When the server returns CAPTCHA_REQUIRED the plugin cannot solve it in-
+ * process.  Instead we open the Fluxer web app in the system browser and
+ * show a purple_request_input dialog asking the user to paste the token
+ * they can copy from DevTools → Local Storage.  The token is then persisted
+ * in account settings so subsequent logins skip both CAPTCHA and this dialog.
+ */
+
+static void
+fluxer_captcha_cancel(gpointer user_data)
+{
+    PurpleConnection *gc = (PurpleConnection *)user_data;
+    purple_connection_error_reason(gc,
+        PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
+        "Login cancelled.");
+}
+
+static void
+fluxer_captcha_got_token(gpointer user_data, const gchar *token)
+{
+    PurpleConnection *gc = (PurpleConnection *)user_data;
+    FluxerData *fd = purple_connection_get_protocol_data(gc);
+    if (!fd) return;
+
+    if (!token || !*token) {
+        purple_connection_error_reason(gc,
+            PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
+            "No token entered. Re-connect and paste your token when prompted.");
+        return;
+    }
+
+    /* Trim leading/trailing whitespace (easy paste accident) */
+    gchar *trimmed = g_strdup(token);
+    g_strstrip(trimmed);
+
+    g_free(fd->token);
+    fd->token = trimmed;
+
+    /* Persist so future logins go straight to fluxer_use_token */
+    purple_account_set_string(fd->account, "token", fd->token);
+    purple_debug_info("fluxer", "CAPTCHA dialog: token received, connecting\n");
+
+    fluxer_use_token(fd);
+}
+
 /* Step 1a: got login response */
 static void
 fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
@@ -1984,12 +2114,56 @@ fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
     }
 
     if (!json_object_has_member(root, "token")) {
-        const gchar *msg = json_object_has_member(root, "message")
+        const gchar *code = json_object_has_member(root, "code")
+            ? json_object_get_string_member(root, "code") : NULL;
+        const gchar *msg  = json_object_has_member(root, "message")
             ? json_object_get_string_member(root, "message")
             : "Login failed — check email and password";
         purple_debug_error("fluxer", "Login failed: %s\n", msg);
-        purple_connection_error_reason(fd->gc,
-            PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, msg);
+
+        /* CAPTCHA_REQUIRED: open the browser for the user and ask them to
+         * paste the resulting session token back into a dialog.  The token
+         * is then saved so subsequent logins are fully automatic. */
+        if (g_strcmp0(code, "CAPTCHA_REQUIRED") == 0) {
+            /* Open the login page in the system browser.
+             * g_spawn_command_line_async("xdg-open …") is more reliable than
+             * purple_notify_uri which goes through GTK notify ops and can
+             * silently fail depending on the desktop environment. */
+            GError *spawn_err = NULL;
+            if (!g_spawn_command_line_async("xdg-open https://fluxer.app",
+                                            &spawn_err)) {
+                purple_debug_warning("fluxer",
+                    "xdg-open failed (%s) — user must open browser manually\n",
+                    spawn_err ? spawn_err->message : "unknown");
+                g_clear_error(&spawn_err);
+            }
+
+            purple_request_input(
+                fd->gc,
+                "Fluxer Login",
+                "Browser authentication required",
+                "Opening https://fluxer.app in your browser.\n"
+                "If no browser opened, navigate there manually.\n\n"
+                "1. Log in with your email and password.\n"
+                "2. Open Developer Tools (F12).\n"
+                "3. Go to Application \xe2\x86\x92 Local Storage "
+                    "\xe2\x86\x92 https://fluxer.app\n"
+                "4. Copy the value of the \"token\" key.\n\n"
+                "Paste your token below. It will be saved so you "
+                "won't need to do this again.",
+                NULL,   /* default value */
+                FALSE,  /* not multiline */
+                FALSE,  /* not masked — token is long, user should verify paste */
+                NULL,   /* no type hint */
+                "Connect", G_CALLBACK(fluxer_captcha_got_token),
+                "Cancel",  G_CALLBACK(fluxer_captcha_cancel),
+                fd->account, NULL, NULL,
+                fd->gc  /* user_data — look up fd inside callbacks */
+            );
+        } else {
+            purple_connection_error_reason(fd->gc,
+                PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, msg);
+        }
         json_object_unref(root);
         return;
     }
@@ -2460,6 +2634,40 @@ fluxer_join_chat(PurpleConnection *gc, GHashTable *components)
 
     const gchar *ch_name = g_hash_table_lookup(fd->channel_names, channel_id);
     serv_got_joined_chat(gc, chat_id, ch_name ? ch_name : channel_id);
+
+    /* Unread notice: if this channel has messages the user hasn't read since
+     * last session, show a separator at the top before history loads. */
+    {
+        const gchar *last_msg  = g_hash_table_lookup(fd->channel_last_msg, channel_id);
+        const gchar *last_read = g_hash_table_lookup(fd->read_states, channel_id);
+        if (fluxer_snowflake_gt(last_msg, last_read)) {
+            PurpleConversation *conv = purple_find_chat(gc, chat_id);
+            if (conv)
+                purple_conversation_write(conv, NULL,
+                    "-- Unread messages since last session --",
+                    PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LOG, time(NULL));
+            /* Advance the stored read position so re-opening doesn't re-warn */
+            if (last_msg)
+                g_hash_table_insert(fd->read_states,
+                                    g_strdup(channel_id), g_strdup(last_msg));
+        }
+        /* Clear the blist unseen-count marker for this channel */
+        PurpleBlistNode *gn, *bn;
+        for (gn = purple_blist_get_root(); gn; gn = gn->next) {
+            if (!PURPLE_BLIST_NODE_IS_GROUP(gn)) continue;
+            for (bn = gn->child; bn; bn = bn->next) {
+                if (!PURPLE_BLIST_NODE_IS_CHAT(bn)) continue;
+                PurpleChat *c = (PurpleChat *)bn;
+                if (purple_chat_get_account(c) != fd->account) continue;
+                const gchar *stored = g_hash_table_lookup(
+                    purple_chat_get_components(c), "channel_id");
+                if (g_strcmp0(stored, channel_id) == 0) {
+                    purple_blist_node_set_int(bn, "unseen-count", 0);
+                    break;
+                }
+            }
+        }
+    }
 
     /* Populate the participant list from the guild's member roster */
     const gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);

@@ -37,7 +37,7 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Markdown rendering (bold/italic/code/strikethrough/underline/spoiler) | ✅ (incoming + outgoing round-trip) |
 | Mention resolution (`<@id>` → username, `<#id>` → channel) | ❌ (TODO) |
 | `@mention` tab highlight (`PURPLE_MESSAGE_NICK`) | ❌ (TODO — implement alongside mention resolution) |
-| Unread indicator on buddy list for closed channels | ❌ (TODO — use `read_states` from READY payload) |
+| Unread indicator on buddy list for closed channels | ✅ (notice shown on open; blist bolding needs upstream Pidgin — see Known Limitations) |
 | Message reply context | ❌ (TODO) |
 | File attachments (links + inline images) | ❌ (TODO) |
 | Buddy avatars | ❌ (TODO) |
@@ -98,7 +98,23 @@ make install-icons   # generates a PNG and installs it with sudo
 4. Username: your Fluxer **email address**
 5. Password: your Fluxer password
 
-### Token login (recommended for persistent sessions)
+### First-time login (CAPTCHA challenge flow)
+
+The Fluxer server requires CAPTCHA verification the first time you log in with
+email and password from a new client. The plugin handles this automatically:
+
+1. Enter your email and password and connect as normal.
+2. The plugin detects the CAPTCHA requirement, **opens fluxer.app in your
+   browser**, and shows a dialog in Pidgin.
+3. Log in to Fluxer in the browser window.
+4. Open **Developer Tools** (`F12`) → **Application** → **Local Storage** →
+   `https://fluxer.app` and copy the value of the `token` key.
+5. Paste the token into the Pidgin dialog and click **Connect**.
+
+The token is saved automatically — subsequent connections are fully automatic
+with no browser step.
+
+### Token login (skip the dialog — power users / bots)
 
 1. Open the **Advanced** tab when adding/editing the account.
 2. Paste your token into the **Token** field.
@@ -148,7 +164,14 @@ contribution targets:
    the bottom; history pages appear below live messages rather than above.
 4. **Protocol UI hints** — no API for a plugin to suggest default window
    behaviours (e.g. hide the participant list by default for large guilds).
-5. **Per-guild display names (server nicknames)** — Discord-compatible platforms
+5. **Blist entry bolding for unread closed channels** — the plugin stores
+   unread state in blist node data (`unseen-count`) and shows a notice when
+   the user opens an unread channel. However, Pidgin only bolds buddy list
+   entries for chats that have an open `PurpleConversation`. There is no
+   public API to bold a closed chat entry without opening a window. Full
+   support requires a new "unseen chat" signal or node-data hook in
+   libpurple's `gtkblist.c`.
+6. **Per-guild display names (server nicknames)** — Discord-compatible platforms
    support a per-server nickname distinct from the global username. libpurple
    buddies have a single global alias; `get_cb_alias` has no room/guild context
    parameter, so per-guild overrides cannot be implemented at the plugin level.
@@ -215,11 +238,10 @@ PRs welcome. The most impactful near-term improvements:
   `@everyone`), add `PURPLE_MESSAGE_NICK` to the flags passed to
   `serv_got_chat_in` — Pidgin will then highlight the tab in a distinct colour
   rather than just bolding it.
-- **Unread indicator for closed channels** — the `READY` payload includes a
-  `read_states` array with `{ id, last_message_id, mention_count }` for every
-  channel. Compare each channel's `last_message_id` against `read_states` at
-  startup; for channels with unread messages set the blist node's unseen state
-  so Pidgin bolds the buddy list entry before the user opens the window.
+- **Blist bolding for unread channels** — `read_states` parsing and
+  `unseen-count` node data are implemented; a notice appears when the user
+  opens an unread channel. Full blist bolding (before opening) requires
+  upstream Pidgin work — see Known Limitations item 5.
 - **File attachments** — render attachment URLs as clickable links; for images,
   optionally show inline using libpurple's image API.
 - MFA (TOTP) login flow
