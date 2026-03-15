@@ -1756,6 +1756,16 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
 {
     FluxerData *fd = purple_connection_get_protocol_data(gc);
 
+    /* Reject self-DM locally without a round-trip */
+    if (g_strcmp0(who, fd->self_username) == 0) {
+        PurpleConversation *conv = purple_find_conversation_with_account(
+            PURPLE_CONV_TYPE_IM, who, fd->account);
+        if (conv)
+            purple_conversation_write(conv, NULL, "You can't DM yourself.",
+                PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LOG, time(NULL));
+        return -1;
+    }
+
     /* Resolve username → user_id via reverse scan of user_names map */
     const gchar *uid = NULL;
     {
