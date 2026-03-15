@@ -7,11 +7,11 @@
  * purple-discord mental model.
  *
  * API docs: https://docs.fluxer.app
- * Source:   https://github.com/fluxerapp/purple-fluxer (future home)
+ * Source:   https://github.com/beadon/purple-fluxer
  *
  * Build deps: libpurple-dev, libjson-glib-dev, libglib2.0-dev
  *
- * SPDX-License-Identifier: GPL-2.0-or-later
+ * SPDX-License-Identifier: GPL-3.0-only
  */
 
 #define PURPLE_PLUGINS
@@ -1504,7 +1504,7 @@ static PurplePluginInfo plugin_info = {
     "Connect to Fluxer (https://fluxer.app), a free and open-source "
     "Discord-compatible messaging platform.",
     "purple-fluxer contributors",
-    "https://github.com/fluxerapp/purple-fluxer",
+    "https://github.com/beadon/purple-fluxer",
 
     fluxer_plugin_load,
     fluxer_plugin_unload,

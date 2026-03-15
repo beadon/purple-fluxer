@@ -51,7 +51,7 @@ sudo pacman -S libpurple json-glib glib2
 ### Compile
 
 ```bash
-git clone https://github.com/fluxerapp/purple-fluxer.git
+git clone https://github.com/beadon/purple-fluxer.git
 cd purple-fluxer
 make
 
