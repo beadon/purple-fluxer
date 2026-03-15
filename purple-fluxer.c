@@ -768,7 +768,18 @@ handle_message_create(FluxerData *fd, JsonObject *d)
     /* Cache user_id → username as we see messages */
     g_hash_table_insert(fd->user_names, g_strdup(author_id), g_strdup(username));
 
-    /* Ignore our own messages */
+    gint ch_type = json_object_has_member(d, "channel_type")
+        ? (gint)json_object_get_int_member(d, "channel_type") : -1;
+
+    /* Personal notes channel (type 999, channel_id == self_user_id):
+     * messages are authored by self — deliver them instead of filtering */
+    if (ch_type == 999) {
+        serv_got_im(fd->gc, fd->self_username, content,
+                    PURPLE_MESSAGE_RECV, time(NULL));
+        return;
+    }
+
+    /* Ignore our own messages in all other channel types */
     if (g_strcmp0(author_id, fd->self_user_id) == 0) return;
 
     gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
@@ -1756,14 +1767,21 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
 {
     FluxerData *fd = purple_connection_get_protocol_data(gc);
 
-    /* Reject self-DM locally without a round-trip */
+    /* Personal notes — channel_id == self_user_id, channel_type 999 */
     if (g_strcmp0(who, fd->self_username) == 0) {
-        PurpleConversation *conv = purple_find_conversation_with_account(
-            PURPLE_CONV_TYPE_IM, who, fd->account);
-        if (conv)
-            purple_conversation_write(conv, NULL, "You can't DM yourself.",
-                PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LOG, time(NULL));
-        return -1;
+        gchar *url = g_strdup_printf("%s/channels/%s/messages",
+                                     fd->api_base, fd->self_user_id);
+        JsonObject *body_obj = json_object_new();
+        gchar *plain = purple_unescape_html(message);
+        json_object_set_string_member(body_obj, "content", plain);
+        gchar *body_str = json_object_to_string(body_obj);
+        json_object_unref(body_obj);
+        g_free(plain);
+        fluxer_http_request(fd, "POST", url, body_str,
+                            fluxer_sent_message_cb, NULL);
+        g_free(url);
+        g_free(body_str);
+        return 1;
     }
 
     /* Resolve username → user_id via reverse scan of user_names map */
