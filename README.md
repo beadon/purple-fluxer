@@ -36,6 +36,8 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Correct sender name in guild chat | ✅ (`OPT_PROTO_UNIQUE_CHATNAME`) |
 | Markdown rendering (bold/italic/code/strikethrough) | ❌ (TODO) |
 | Mention resolution (`<@id>` → username, `<#id>` → channel) | ❌ (TODO) |
+| `@mention` tab highlight (`PURPLE_MESSAGE_NICK`) | ❌ (TODO — implement alongside mention resolution) |
+| Unread indicator on buddy list for closed channels | ❌ (TODO — use `read_states` from READY payload) |
 | Message reply context | ❌ (TODO) |
 | File attachments (links + inline images) | ❌ (TODO) |
 | Buddy avatars | ❌ (TODO) |
@@ -202,11 +204,29 @@ fluxer_login()
 
 PRs welcome. The most impactful near-term improvements:
 
+- **Markdown rendering** — convert Discord markdown dialect (bold, italic,
+  strikethrough, inline code, code blocks, spoilers) to Pidgin HTML before
+  passing to `serv_got_chat_in` / `serv_got_im`. Reference: `discord-markdown.c`
+  in purple-discord.
+- **Mention resolution + `@mention` tab highlight** — `MESSAGE_CREATE` embeds
+  raw IDs: `<@user_id>`, `<#channel_id>`, `@everyone`. Replace with display
+  names using the existing `user_names` and `channel_names` maps. When the
+  resolved name matches `fd->self_username` (or the message contains
+  `@everyone`), add `PURPLE_MESSAGE_NICK` to the flags passed to
+  `serv_got_chat_in` — Pidgin will then highlight the tab in a distinct colour
+  rather than just bolding it.
+- **Unread indicator for closed channels** — the `READY` payload includes a
+  `read_states` array with `{ id, last_message_id, mention_count }` for every
+  channel. Compare each channel's `last_message_id` against `read_states` at
+  startup; for channels with unread messages set the blist node's unseen state
+  so Pidgin bolds the buddy list entry before the user opens the window.
+- **File attachments** — render attachment URLs as clickable links; for images,
+  optionally show inline using libpurple's image API.
 - MFA (TOTP) login flow
 - `TYPING_START` → `serv_got_typing()` (needs user_id→username index, already collected)
 - Buddy avatar download and caching
 - `GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE` events (live member list updates)
-- Thread/reply rendering
+- Message reply context (quote preview above the reply body)
 
 See the "Known limitations" section above for upstream Pidgin contribution
 opportunities.
