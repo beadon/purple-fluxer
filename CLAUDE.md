@@ -14,11 +14,15 @@ purple-discord but written fresh against Fluxer's documented API.
 The plugin compiles cleanly against libpurple 2.14.x and is functional for
 day-to-day text messaging. All earlier API binding issues have been resolved.
 
-Working: login (email+password or token), WebSocket gateway, heartbeat,
-guild/channel buddy list with category nesting, channel history on open,
-`/more` pagination, message send/receive, edit/delete notifications, guild
-member list population via `REQUEST_GUILD_MEMBERS`, presence sync, room
-list, DMs.
+Working: login (email+password or token), CAPTCHA challenge/response dialog
+(opens browser + token paste), WebSocket gateway, heartbeat, guild/channel
+buddy list with category nesting, channel history on open, `/more` pagination,
+message send/receive, edit/delete notifications, guild member list population
+via `REQUEST_GUILD_MEMBERS`, presence sync, room list, DMs, unread channel
+indicators (`unseen-count` node data + notice on open), typing indicators
+(send + receive for DMs), Discord markdown rendering (incoming + outgoing
+round-trip), mention resolution (`<@id>` / `<#id>`), `@mention` tab highlight
+(`PURPLE_MESSAGE_NICK`).
 
 ---
 
@@ -27,11 +31,12 @@ list, DMs.
 ```bash
 sudo apt install libpurple-dev libjson-glib-dev libglib2.0-dev
 make
-make install-user     # installs to ~/.purple/plugins/
-
-# Install protocol icon (requires sudo — Pidgin 2.x has no user-local icon path):
-make install-icons
+make install-user     # installs to ~/.purple/plugins/ (no sudo)
+sudo make install     # system-wide install, includes icons automatically
 ```
+
+`make install` depends on `install-icons` — icons are always co-installed.
+`make install-user` does not install icons (no user-local icon path in Pidgin 2.x).
 
 ---
 
@@ -67,7 +72,7 @@ fluxer_login()
 | `MESSAGE_CREATE` | `handle_message_create()` — routes to DM or guild chat |
 | `MESSAGE_UPDATE` | `handle_message_update()` — edit notice + re-posts new content |
 | `MESSAGE_DELETE` | `handle_message_delete()` — deletion notice with attribution |
-| `TYPING_START` | stub — needs user_id→username lookup |
+| `TYPING_START` | `handle_typing_start()` — DM typing via `serv_got_typing`; guild channels silently dropped (libpurple limitation) |
 | `PRESENCE_UPDATE` | `handle_presence_update()` — maps status to libpurple status |
 
 ### Data structures in FluxerData
@@ -80,6 +85,8 @@ fluxer_login()
 - `seeded_channels`: `channel_id → 1` (session-level dedup for buddy list)
 - `user_names`: `user_id → username` (seeded from READY, MESSAGE_CREATE, member chunks)
 - `oldest_msg_id`: `channel_id → snowflake` (cursor for `/more` pagination)
+- `read_states`: `channel_id → last_read_msg_id` (from READY payload; used for unread detection)
+- `channel_last_msg`: `channel_id → last_message_id` (newest known message per channel; from GUILD_CREATE channel objects)
 - `guild_members`: `guild_id → GList* of usernames` (for chat room population)
 
 ### Guild/channel buddy list layout
@@ -184,6 +191,31 @@ purple-fluxer development:
    appends; historical messages land below live messages.
 4. **Protocol UI hints** — no mechanism for a plugin to suggest default
    window behaviour (e.g. hide participant list for large-guild channels).
+5. **Blist entry bolding for unread closed channels** — `unseen-count` node
+   data is written and a notice appears on open, but Pidgin only bolds blist
+   chat entries when a `PurpleConversation` is open. Requires a new
+   "unseen chat" signal or node-data hook in `gtkblist.c`.
+6. **Typing indicators in guild chat rooms** — `serv_got_typing` /
+   `send_typing` are IM-only APIs; no equivalent for `PurpleConvChat`.
+   Proposed API: `serv_got_chat_typing(gc, chat_id, username, state)` and a
+   `chat_send_typing` prpl op alongside `send_typing`.
+7. **Per-guild display names (server nicknames)** — libpurple buddies have a
+   single global alias. `get_cb_alias` has no room/guild context parameter so
+   per-guild nickname overrides cannot be implemented at the plugin level.
+
+---
+
+## Pending plugin work
+
+Features not yet implemented (contributions welcome):
+
+- **File attachments** — render attachment URLs as clickable links; inline images via libpurple image API
+- **Buddy avatars** — download and cache per-user avatar URLs
+- **`GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE`** — live member list updates
+- **Message reply context** — quote preview above the reply body
+- **Reactions display** — show emoji reaction counts on messages
+- **MFA / TOTP login** — 6-digit TOTP code entry after email+password
+- **`@everyone` / `@here` highlight** — add `PURPLE_MESSAGE_NICK` when message contains these strings
 
 ---
 
