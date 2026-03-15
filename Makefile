@@ -18,7 +18,7 @@ SYSTEM_PLUGINDIR = $(shell pkg-config --variable=plugindir purple)
 USER_PLUGINDIR   = $(HOME)/.purple/plugins
 
 # Pidgin 2.x hardcodes protocol icons to the system DATADIR — no user override path exists.
-# 'make install-icons' installs the official Fluxer icons system-wide (requires sudo).
+# Icons are installed/uninstalled together with the system plugin.
 ICON_DIR = /usr/share/pixmaps/pidgin/protocols
 
 .PHONY: all clean install install-user uninstall uninstall-user install-icons uninstall-icons
@@ -31,7 +31,7 @@ $(PLUGIN_SO): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-install: $(PLUGIN_SO)
+install: $(PLUGIN_SO) install-icons
 	install -d $(SYSTEM_PLUGINDIR)
 	install -m 644 $(PLUGIN_SO) $(SYSTEM_PLUGINDIR)
 
@@ -39,21 +39,20 @@ install-user: $(PLUGIN_SO)
 	install -d $(USER_PLUGINDIR)
 	install -m 644 $(PLUGIN_SO) $(USER_PLUGINDIR)
 
-uninstall:
+uninstall: uninstall-icons
 	rm -f $(SYSTEM_PLUGINDIR)/$(PLUGIN_SO)
 
 uninstall-user:
 	rm -f $(USER_PLUGINDIR)/$(PLUGIN_SO)
 
-# Pidgin 2.x has no user-local icon path — system install is unavoidable.
 install-icons:
-	sudo install -Dm644 icons/fluxer16.png $(ICON_DIR)/16/fluxer.png
-	sudo install -Dm644 icons/fluxer22.png $(ICON_DIR)/22/fluxer.png
-	sudo install -Dm644 icons/fluxer48.png $(ICON_DIR)/48/fluxer.png
+	install -Dm644 icons/fluxer16.png $(ICON_DIR)/16/fluxer.png
+	install -Dm644 icons/fluxer22.png $(ICON_DIR)/22/fluxer.png
+	install -Dm644 icons/fluxer48.png $(ICON_DIR)/48/fluxer.png
 
 uninstall-icons:
-	sudo rm -f $(ICON_DIR)/16/fluxer.png $(ICON_DIR)/22/fluxer.png \
-	           $(ICON_DIR)/48/fluxer.png
+	rm -f $(ICON_DIR)/16/fluxer.png $(ICON_DIR)/22/fluxer.png \
+	      $(ICON_DIR)/48/fluxer.png
 
 clean:
 	rm -f $(OBJS) $(PLUGIN_SO)
