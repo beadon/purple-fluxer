@@ -209,13 +209,15 @@ purple-fluxer development:
 
 Features not yet implemented (contributions welcome):
 
-- **File attachments** — render attachment URLs as clickable links; inline images via libpurple image API
+- **Send images / file attachments** — set `OPT_PROTO_IM_IMAGE` to unlock Pidgin's Insert Image UI; implement multipart/form-data upload to `POST /channels/{id}/messages`; extract outgoing `<img id="N">` from message body via `purple_imgstore_get_by_id`
+- **Receive non-image file attachments** — currently shown as `<a href>` links (functional); no inline preview
 - **Buddy avatars** — download and cache per-user avatar URLs
 - **`GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE`** — live member list updates
 - **Message reply context** — quote preview above the reply body
 - **Reactions display** — show emoji reaction counts on messages
 - **MFA / TOTP login** — 6-digit TOTP code entry after email+password
 - **`@everyone` / `@here` highlight** — add `PURPLE_MESSAGE_NICK` when message contains these strings
+- **DM history on login** — DM channels are not fetched/replayed on connect; unread DMs are invisible until a new message arrives. Should fetch last N messages for each DM channel in the READY payload's `private_channels` list, same as guild channel history on `fluxer_join_chat`
 
 ---
 

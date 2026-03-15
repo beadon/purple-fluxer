@@ -37,6 +37,7 @@
 #include <server.h>
 #include <sslconn.h>
 #include <cmds.h>
+#include <imgstore.h>
 #include <util.h>
 #include <version.h>
 
@@ -1212,15 +1213,133 @@ fluxer_resolve_mentions(FluxerData *fd, const gchar *content, gboolean *out_nick
     return g_string_free(out, FALSE);
 }
 
+/* Pure router: deliver an already-formatted HTML message to the correct
+ * DM or guild chat window. Caller is responsible for all flag decisions
+ * (SEND vs RECV, NICK, IMAGES) and for filtering messages that should
+ * not be displayed (e.g. self-sent DMs). */
+static void
+fluxer_deliver_to_conv(FluxerData *fd, const gchar *channel_id,
+                       const gchar *username, const gchar *html,
+                       PurpleMessageFlags flags, time_t ts)
+{
+    gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+
+    if (guild_id == NULL) {
+        serv_got_im(fd->gc, username, html, flags, ts);
+    } else {
+        /* Guild channel — OPT_PROTO_UNIQUE_CHATNAME keeps 'who' verbatim */
+        gpointer chat_id_ptr = g_hash_table_lookup(fd->chat_id_map, channel_id);
+        if (!chat_id_ptr) return;
+        serv_got_chat_in(fd->gc, GPOINTER_TO_INT(chat_id_ptr),
+                         username, flags, html, ts);
+    }
+}
+
+/* ─── Attachment / inline image fetch ────────────────────────────────────── */
+
+typedef struct {
+    FluxerData         *fd;
+    gchar              *channel_id;
+    gchar              *username;    /* pre-resolved display name for the message */
+    PurpleMessageFlags  flags;       /* pre-computed: RECV or SEND, plus IMAGES */
+    gchar              *filename;
+} ImageFetchData;
+
+static void
+fluxer_image_fetch_cb(PurpleUtilFetchUrlData *url_data, gpointer user_data,
+                      const gchar *buf, gsize len, const gchar *error)
+{
+    ImageFetchData *ifd = user_data;
+    FluxerData *fd = ifd->fd;
+
+    fd->pending_http = g_slist_remove(fd->pending_http, url_data);
+
+    if (error || !buf || len == 0) {
+        purple_debug_warning("fluxer", "Image fetch failed: %s\n",
+                             error ? error : "empty response");
+        goto done;
+    }
+
+    /* purple_imgstore_add_with_id takes ownership of the data buffer */
+    gpointer img_data = g_malloc(len);
+    memcpy(img_data, buf, len);
+    int img_id = purple_imgstore_add_with_id(img_data, len, ifd->filename);
+
+    if (img_id <= 0) {
+        purple_debug_warning("fluxer", "imgstore add failed for %s\n",
+                             ifd->filename);
+        g_free(img_data);
+        goto done;
+    }
+
+    purple_debug_info("fluxer", "Inline image stored: id=%d file=%s len=%"
+                      G_GSIZE_FORMAT "\n", img_id, ifd->filename, len);
+
+    gchar *img_html = g_strdup_printf("<img id=\"%d\">", img_id);
+    fluxer_deliver_to_conv(fd, ifd->channel_id, ifd->username,
+                           img_html, ifd->flags, time(NULL));
+    g_free(img_html);
+
+done:
+    g_free(ifd->channel_id);
+    g_free(ifd->username);
+    g_free(ifd->filename);
+    g_free(ifd);
+}
+
+static void
+fluxer_fetch_image(FluxerData *fd, const gchar *url, const gchar *filename,
+                   const gchar *channel_id, const gchar *username,
+                   PurpleMessageFlags flags)
+{
+    ImageFetchData *ifd = g_new0(ImageFetchData, 1);
+    ifd->fd         = fd;
+    ifd->channel_id = g_strdup(channel_id);
+    ifd->username   = g_strdup(username);
+    ifd->flags      = flags | PURPLE_MESSAGE_IMAGES;
+    ifd->filename   = g_strdup(filename);
+
+    /* Plain GET — CDN URLs don't need auth headers.
+     * Pass an explicit 10 MB limit; -1 silently defaults to 512 KB. */
+    PurpleUtilFetchUrlData *fetch =
+        purple_util_fetch_url_request_data_len_with_account(
+            fd->account, url, TRUE, FLUXER_USER_AGENT, FALSE,
+            NULL, 0, FALSE, 10 * 1024 * 1024,
+            fluxer_image_fetch_cb, ifd);
+
+    if (fetch) {
+        fd->pending_http = g_slist_prepend(fd->pending_http, fetch);
+    } else {
+        purple_debug_error("fluxer", "Image fetch failed to start: %s\n", url);
+        g_free(ifd->channel_id);
+        g_free(ifd->username);
+        g_free(ifd->filename);
+        g_free(ifd);
+    }
+}
+
+/* Returns TRUE if a content_type string or filename extension indicates an
+ * image type that Pidgin can render inline. */
+static gboolean
+fluxer_is_image(const gchar *content_type, const gchar *filename)
+{
+    if (content_type && g_str_has_prefix(content_type, "image/"))
+        return TRUE;
+    if (!filename) return FALSE;
+    return g_str_has_suffix(filename, ".png")  ||
+           g_str_has_suffix(filename, ".jpg")  ||
+           g_str_has_suffix(filename, ".jpeg") ||
+           g_str_has_suffix(filename, ".gif")  ||
+           g_str_has_suffix(filename, ".webp");
+}
+
 static void
 handle_message_create(FluxerData *fd, JsonObject *d)
 {
     const gchar *channel_id = json_object_get_string_member(d, "channel_id");
     const gchar *content    = json_object_get_string_member(d, "content");
 
-    if (!content || *content == '\0') return;  /* attachment-only, skip for now */
-
-    JsonObject *author  = json_object_get_object_member(d, "author");
+    JsonObject *author     = json_object_get_object_member(d, "author");
     const gchar *author_id = json_object_get_string_member(author, "id");
     const gchar *username  = json_object_get_string_member(author, "username");
 
@@ -1230,45 +1349,60 @@ handle_message_create(FluxerData *fd, JsonObject *d)
     gint ch_type = json_object_has_member(d, "channel_type")
         ? (gint)json_object_get_int_member(d, "channel_type") : -1;
 
-    /* Resolve inline mentions; detect if we were mentioned. */
-    gboolean is_nick = FALSE;
-    gchar *resolved = fluxer_format_content(fd, content, &is_nick);
-
-    /* Personal notes (type 999): authored by self, deliver as IM */
+    /* Personal notes (type 999): always RECV from self_username; no attachments */
     if (ch_type == 999) {
-        serv_got_im(fd->gc, fd->self_username, resolved,
-                    PURPLE_MESSAGE_RECV, time(NULL));
-        g_free(resolved);
+        if (content && *content != '\0') {
+            gboolean dummy = FALSE;
+            gchar *resolved = fluxer_format_content(fd, content, &dummy);
+            serv_got_im(fd->gc, fd->self_username, resolved,
+                        PURPLE_MESSAGE_RECV, time(NULL));
+            g_free(resolved);
+        }
         return;
     }
 
     gboolean is_self = (g_strcmp0(author_id, fd->self_user_id) == 0);
-    gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+    gboolean is_guild = (g_hash_table_lookup(fd->channel_to_guild, channel_id) != NULL);
     time_t ts = time(NULL);
 
-    if (guild_id == NULL) {
-        /* DM — libpurple echoes outgoing IMs automatically, drop self */
-        if (is_self) { g_free(resolved); return; }
-        serv_got_im(fd->gc, username, resolved, PURPLE_MESSAGE_RECV, ts);
-    } else {
-        /* Guild channel — gateway echo is the display path for all messages,
-         * including our own (libpurple does not auto-echo for chats).
-         * OPT_PROTO_UNIQUE_CHATNAME ensures the 'who' name is used verbatim
-         * even for PURPLE_MESSAGE_SEND, so self-messages show "beadon" not
-         * the login email. */
-        gpointer chat_id_ptr =
-            g_hash_table_lookup(fd->chat_id_map, channel_id);
-        if (chat_id_ptr) {
-            gint chat_id = GPOINTER_TO_INT(chat_id_ptr);
-            PurpleMessageFlags mflags =
-                is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
-            if (is_nick && !is_self)
-                mflags |= PURPLE_MESSAGE_NICK;
-            serv_got_chat_in(fd->gc, chat_id, username, mflags, resolved, ts);
-        }
+    /* DMs from self: libpurple echoes outgoing IMs — skip to prevent double-display */
+    if (!is_guild && is_self) return;
+
+    /* Compute base flags once for all content in this message */
+    PurpleMessageFlags base_flags = is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
+
+    /* Text content */
+    if (content && *content != '\0') {
+        gboolean is_nick = FALSE;
+        gchar *resolved = fluxer_format_content(fd, content, &is_nick);
+        PurpleMessageFlags flags = base_flags | (is_nick ? PURPLE_MESSAGE_NICK : 0);
+        fluxer_deliver_to_conv(fd, channel_id, username, resolved, flags, ts);
+        g_free(resolved);
     }
 
-    g_free(resolved);
+    /* Attachments — images fetched async and displayed inline; others as links */
+    if (!json_object_has_member(d, "attachments")) return;
+    JsonArray *atts = json_object_get_array_member(d, "attachments");
+    guint natt = json_array_get_length(atts);
+    for (guint i = 0; i < natt; i++) {
+        JsonObject *att      = json_array_get_object_element(atts, i);
+        const gchar *url     = json_object_get_string_member(att, "url");
+        const gchar *fname   = json_object_has_member(att, "filename")
+            ? json_object_get_string_member(att, "filename") : NULL;
+        const gchar *ctype   = json_object_has_member(att, "content_type")
+            ? json_object_get_string_member(att, "content_type") : NULL;
+        if (!url) continue;
+
+        if (fluxer_is_image(ctype, fname)) {
+            fluxer_fetch_image(fd, url, fname ? fname : "image",
+                               channel_id, username, base_flags);
+        } else {
+            gchar *link = g_strdup_printf("<a href=\"%s\">%s</a>",
+                                          url, fname ? fname : url);
+            fluxer_deliver_to_conv(fd, channel_id, username, link, base_flags, ts);
+            g_free(link);
+        }
+    }
 }
 
 /* Extract HH:MM:SS from an ISO 8601 string like "2026-03-15T08:23:14.425Z".
@@ -1333,51 +1467,92 @@ handle_message_update(FluxerData *fd, JsonObject *d)
     const gchar *content    = json_object_has_member(d, "content")
                             ? json_object_get_string_member(d, "content") : NULL;
 
-    if (!content || *content == '\0') return;
-
     const gchar *author_id = NULL;
     const gchar *username  = NULL;
     if (json_object_has_member(d, "author")) {
         JsonObject *author = json_object_get_object_member(d, "author");
         author_id = json_object_get_string_member(author, "id");
         username  = json_object_get_string_member(author, "username");
-        if (username)
-            g_hash_table_insert(fd->user_names, g_strdup(author_id), g_strdup(username));
+        if (author_id && username)
+            g_hash_table_insert(fd->user_names,
+                                g_strdup(author_id), g_strdup(username));
     }
 
-    /* Timestamps: original send time and edit time */
+    /* Decide who gets credited and with what flags.
+     * Notes channel (channel_id == self_user_id): deliver as RECV from self_username.
+     * DM from self: skip (libpurple echoes outgoing IMs).
+     * All other cases: SEND for self, RECV for others. */
+    gboolean is_notes = g_strcmp0(channel_id, fd->self_user_id) == 0;
+    gboolean is_self  = author_id
+        ? (g_strcmp0(author_id, fd->self_user_id) == 0) : FALSE;
+    gboolean is_guild = (g_hash_table_lookup(fd->channel_to_guild, channel_id) != NULL);
+
+    const gchar *display_name;
+    PurpleMessageFlags base_flags;
+    if (is_notes) {
+        display_name = fd->self_username;
+        base_flags   = PURPLE_MESSAGE_RECV;
+    } else if (!is_guild && is_self) {
+        /* Self DM: suppress to avoid echo */
+        display_name = NULL;
+        base_flags   = 0;
+    } else {
+        display_name = username;
+        base_flags   = is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
+    }
+
     const gchar *orig_ts = json_object_has_member(d, "timestamp")
                          ? json_object_get_string_member(d, "timestamp") : NULL;
     const gchar *edit_ts = json_object_has_member(d, "edited_timestamp") &&
                            !json_node_is_null(json_object_get_member(d, "edited_timestamp"))
                          ? json_object_get_string_member(d, "edited_timestamp") : NULL;
 
-    /* System notice: who edited and when */
-    gchar *orig_str = g_strdup(iso_time(orig_ts));
-    gchar *edit_str = g_strdup(iso_time(edit_ts));
-    gchar *notice   = g_strdup_printf("* %s edited [%s → %s]",
-                                      username ? username : "unknown",
-                                      orig_str, edit_str);
-    fluxer_conv_notice(fd, channel_id, notice);
-    g_free(orig_str);
-    g_free(edit_str);
-    g_free(notice);
+    /* Real text edit (edited_timestamp is set) — show notice and re-post content */
+    if (edit_ts && content && *content != '\0' && display_name) {
+        gchar *orig_str = g_strdup(iso_time(orig_ts));
+        gchar *edit_str = g_strdup(iso_time(edit_ts));
+        gchar *notice   = g_strdup_printf("* %s edited [%s → %s]",
+                                          display_name, orig_str, edit_str);
+        fluxer_conv_notice(fd, channel_id, notice);
+        g_free(orig_str);
+        g_free(edit_str);
+        g_free(notice);
 
-    /* Re-post the new content inline */
-    if (!username) return;
-    gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
-    gchar *edited   = g_strdup_printf("[edited] %s", content);
-    time_t ts       = time(NULL);
-
-    if (guild_id == NULL) {
-        serv_got_im(fd->gc, username, edited, PURPLE_MESSAGE_RECV, ts);
-    } else {
-        gpointer chat_id_ptr = g_hash_table_lookup(fd->chat_id_map, channel_id);
-        if (chat_id_ptr)
-            serv_got_chat_in(fd->gc, GPOINTER_TO_INT(chat_id_ptr), username,
-                             PURPLE_MESSAGE_RECV, edited, ts);
+        gchar *edited = g_strdup_printf("[edited] %s", content);
+        fluxer_deliver_to_conv(fd, channel_id, display_name, edited, base_flags, time(NULL));
+        g_free(edited);
     }
-    g_free(edited);
+
+    /* Embed expansion — server fires MESSAGE_UPDATE when it resolves a URL
+     * (Tenor GIF, image link) into a rich embed. Fetch and display inline. */
+    if (!display_name || !json_object_has_member(d, "embeds")) return;
+    JsonArray *embeds = json_object_get_array_member(d, "embeds");
+    guint nemb = json_array_get_length(embeds);
+    for (guint i = 0; i < nemb; i++) {
+        JsonObject *emb    = json_array_get_object_element(embeds, i);
+        const gchar *etype = json_object_has_member(emb, "type")
+            ? json_object_get_string_member(emb, "type") : NULL;
+
+        /* gifv uses "thumbnail"; image embeds use "image" */
+        JsonObject *img_obj = NULL;
+        if (json_object_has_member(emb, "thumbnail"))
+            img_obj = json_object_get_object_member(emb, "thumbnail");
+        else if (json_object_has_member(emb, "image"))
+            img_obj = json_object_get_object_member(emb, "image");
+        if (!img_obj) continue;
+
+        const gchar *ctype   = json_object_has_member(img_obj, "content_type")
+            ? json_object_get_string_member(img_obj, "content_type") : NULL;
+        const gchar *img_url = json_object_has_member(img_obj, "proxy_url")
+            ? json_object_get_string_member(img_obj, "proxy_url")
+            : (json_object_has_member(img_obj, "url")
+               ? json_object_get_string_member(img_obj, "url") : NULL);
+        if (!img_url) continue;
+
+        const gchar *fname = (g_strcmp0(etype, "gifv") == 0) ? "embed.gif" : "embed.png";
+        if (fluxer_is_image(ctype, fname))
+            fluxer_fetch_image(fd, img_url, fname, channel_id, display_name, base_flags);
+    }
 }
 
 static void
