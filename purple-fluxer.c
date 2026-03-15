@@ -1020,17 +1020,6 @@ handle_guild_create(FluxerData *fd, JsonObject *d)
 
     const gchar *guild_id = json_object_get_string_member(d, "id");
 
-    /* Log all top-level keys so we can see exactly what Fluxer sends */
-    {
-        GList *keys = json_object_get_members(d);
-        GString *key_str = g_string_new(NULL);
-        for (GList *l = keys; l; l = l->next)
-            g_string_append_printf(key_str, "%s ", (gchar *)l->data);
-        purple_debug_info("fluxer", "GUILD_CREATE keys: %s\n", key_str->str);
-        g_string_free(key_str, TRUE);
-        g_list_free(keys);
-    }
-
     /* Guild name: try top-level "name", then "properties"."name" */
     const gchar *guild_name = NULL;
     if (json_object_has_member(d, "name"))
