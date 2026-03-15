@@ -1673,6 +1673,7 @@ fluxer_close(PurpleConnection *gc)
 typedef struct {
     FluxerData *fd;
     gchar *who;         /* buddy username */
+    gchar *uid;         /* recipient user_id (owned) */
     gchar *message;
 } SendImData;
 
@@ -1693,9 +1694,11 @@ fluxer_got_open_dm_cb(FluxerData *fd, const gchar *body, gpointer user_data)
 
     const gchar *ch_id = json_object_get_string_member(root, "id");
 
-    /* Cache dm_channel for this user */
-    /* We need user_id; look it up from who in dm_channels by reverse scan */
-    /* For now use the channel id directly */
+    /* Cache so future sends go direct without re-opening */
+    if (sid->uid && ch_id)
+        g_hash_table_insert(fd->dm_channels,
+                            g_strdup(sid->uid), g_strdup(ch_id));
+
     gchar *url  = g_strdup_printf("%s/channels/%s/messages", fd->api_base, ch_id);
     JsonObject *msg_body = json_object_new();
     json_object_set_string_member(msg_body, "content", sid->message);
@@ -1708,6 +1711,7 @@ fluxer_got_open_dm_cb(FluxerData *fd, const gchar *body, gpointer user_data)
     g_free(url);
     g_free(msg_str);
     g_free(sid->who);
+    g_free(sid->uid);
     g_free(sid->message);
     g_free(sid);
 }
@@ -1718,38 +1722,52 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
 {
     FluxerData *fd = purple_connection_get_protocol_data(gc);
 
-    /* Find channel_id for this buddy via dm_channels (keyed by user_id).
-     * We may know their user_id from handle if it matches; otherwise we need
-     * to open a DM. For now we look up the buddy's "uid" proto_data field or
-     * fall back to opening a DM by username. */
-
-    /* Try to find existing DM channel by scanning dm_channels values */
-    gchar *ch_id = NULL;
-    GHashTableIter iter;
-    gpointer k, v;
-    g_hash_table_iter_init(&iter, fd->dm_channels);
-    while (g_hash_table_iter_next(&iter, &k, &v)) {
-        /* k = user_id, v = channel_id
-         * We'd need a separate user_id→username map to do this right;
-         * for now we open a DM via the API using a search for the buddy */
-        (void)k; (void)v;
+    /* Resolve username → user_id via reverse scan of user_names map */
+    const gchar *uid = NULL;
+    {
+        GHashTableIter it;
+        gpointer k, v;
+        g_hash_table_iter_init(&it, fd->user_names);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            if (g_strcmp0((const gchar *)v, who) == 0) {
+                uid = (const gchar *)k;
+                break;
+            }
+        }
     }
 
-    if (!ch_id) {
-        /* Open DM — Fluxer uses POST /users/@me/channels with recipient_id.
-         * We need the recipient's user_id; we'll use a buddy data annotation
-         * that we set during READY / PRESENCE_UPDATE. */
+    /* Fall back to buddy protocol data (set for DM buddies from READY) */
+    if (!uid) {
         PurpleBuddy *buddy = purple_find_buddy(fd->account, who);
-        const gchar *uid = buddy
-            ? purple_buddy_get_protocol_data(buddy) : NULL;
+        uid = buddy ? purple_buddy_get_protocol_data(buddy) : NULL;
+    }
 
-        if (!uid) {
-            purple_debug_warning("fluxer",
-                "Cannot send to %s: user_id unknown. "
-                "Try opening a DM from the buddy list first.\n", who);
-            return -1;
-        }
+    if (!uid) {
+        purple_debug_warning("fluxer",
+            "Cannot send to %s: user_id unknown\n", who);
+        return -1;
+    }
 
+    /* If we already have a DM channel for this user, send directly */
+    const gchar *ch_id = g_hash_table_lookup(fd->dm_channels, uid);
+    if (ch_id) {
+        gchar *url = g_strdup_printf("%s/channels/%s/messages",
+                                     fd->api_base, ch_id);
+        JsonObject *body_obj = json_object_new();
+        gchar *plain = purple_unescape_html(message);
+        json_object_set_string_member(body_obj, "content", plain);
+        gchar *body_str = json_object_to_string(body_obj);
+        json_object_unref(body_obj);
+        g_free(plain);
+        fluxer_http_request(fd, "POST", url, body_str,
+                            fluxer_sent_message_cb, NULL);
+        g_free(url);
+        g_free(body_str);
+        return 1;
+    }
+
+    /* No existing DM channel — open one via POST /users/@me/channels */
+    {
         gchar *url = g_strdup_printf("%s/users/@me/channels", fd->api_base);
         JsonObject *body_obj = json_object_new();
         json_object_set_string_member(body_obj, "recipient_id", uid);
@@ -1759,6 +1777,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         SendImData *sid = g_new0(SendImData, 1);
         sid->fd      = fd;
         sid->who     = g_strdup(who);
+        sid->uid     = g_strdup(uid);
         sid->message = purple_unescape_html(message);
 
         fluxer_http_request(fd, "POST", url, body_str,
@@ -1768,20 +1787,6 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         return 1;
     }
 
-    gchar *url = g_strdup_printf("%s/channels/%s/messages",
-                                 fd->api_base, ch_id);
-    JsonObject *body_obj = json_object_new();
-    gchar *plain = purple_unescape_html(message);
-    json_object_set_string_member(body_obj, "content", plain);
-    gchar *body_str = json_object_to_string(body_obj);
-    json_object_unref(body_obj);
-    g_free(plain);
-
-    fluxer_http_request(fd, "POST", url, body_str,
-                        fluxer_sent_message_cb, NULL);
-    g_free(url);
-    g_free(body_str);
-    return 1;
 }
 
 static int
