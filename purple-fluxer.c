@@ -760,6 +760,107 @@ handle_ready(FluxerData *fd, JsonObject *d)
     purple_connection_update_progress(fd->gc, "Connected", 3, 3);
 }
 
+/* Convert Pidgin's outgoing HTML (produced by GtkIMHtml when
+ * PURPLE_CONNECTION_HTML is set) back to Discord markdown so the server
+ * stores plain markdown rather than raw HTML tags.
+ *
+ * Tag mapping (inverse of fluxer_markdown_to_html):
+ *   <b> / <strong>        →  **
+ *   <i> / <em>            →  *
+ *   <u>                   →  __
+ *   <s> / <strike>        →  ~~
+ *   <font face="monospace">  →  `   (inline code)
+ *   <br> / <br/>          →  \n
+ *   all other tags        →  stripped
+ *
+ * HTML entities are unescaped (&amp; &lt; &gt; &apos; &quot; &#NNN;).
+ * Returns a newly-allocated string; caller must g_free().
+ */
+static gchar *
+fluxer_html_to_discord(const gchar *html)
+{
+    GString *out = g_string_sized_new(strlen(html));
+    const gchar *p = html;
+
+    while (*p) {
+        if (*p != '<' && *p != '&') {
+            g_string_append_c(out, *p++);
+            continue;
+        }
+
+        /* ── HTML entity ── */
+        if (*p == '&') {
+            if (g_ascii_strncasecmp(p, "&amp;",  5) == 0) { g_string_append_c(out, '&');  p += 5; }
+            else if (g_ascii_strncasecmp(p, "&lt;",   4) == 0) { g_string_append_c(out, '<');  p += 4; }
+            else if (g_ascii_strncasecmp(p, "&gt;",   4) == 0) { g_string_append_c(out, '>');  p += 4; }
+            else if (g_ascii_strncasecmp(p, "&quot;", 6) == 0) { g_string_append_c(out, '"');  p += 6; }
+            else if (g_ascii_strncasecmp(p, "&apos;", 6) == 0) { g_string_append_c(out, '\''); p += 6; }
+            else if (g_ascii_strncasecmp(p, "&nbsp;", 6) == 0) { g_string_append_c(out, ' ');  p += 6; }
+            else if (p[1] == '#') {
+                /* Numeric entity: &#NNN; or &#xHH; */
+                const gchar *semi = strchr(p + 2, ';');
+                if (semi) {
+                    gunichar ch = (p[2] == 'x' || p[2] == 'X')
+                        ? (gunichar)strtoul(p + 3, NULL, 16)
+                        : (gunichar)strtoul(p + 2, NULL, 10);
+                    gchar buf[6]; gint len = g_unichar_to_utf8(ch, buf);
+                    g_string_append_len(out, buf, len);
+                    p = semi + 1;
+                } else {
+                    g_string_append_c(out, *p++);
+                }
+            } else {
+                g_string_append_c(out, *p++);
+            }
+            continue;
+        }
+
+        /* ── HTML tag ── */
+        /* Find closing '>' */
+        const gchar *tag_end = strchr(p + 1, '>');
+        if (!tag_end) { g_string_append_c(out, *p++); continue; }
+
+        /* Extract tag name (lowercase for comparison) */
+        gchar tag_buf[32] = {0};
+        const gchar *s = p + 1;
+        if (*s == '/') s++;   /* closing tag */
+        gsize ti = 0;
+        while (*s && *s != '>' && *s != ' ' && *s != '/' && ti < sizeof(tag_buf)-1)
+            tag_buf[ti++] = g_ascii_tolower(*s++);
+
+        gboolean closing = (p[1] == '/');
+
+        /* Map tags to markdown delimiters */
+        if (g_strcmp0(tag_buf, "b") == 0 || g_strcmp0(tag_buf, "strong") == 0)
+            g_string_append(out, "**");
+        else if (g_strcmp0(tag_buf, "i") == 0 || g_strcmp0(tag_buf, "em") == 0)
+            g_string_append(out, "*");
+        else if (g_strcmp0(tag_buf, "u") == 0)
+            g_string_append(out, "__");
+        else if (g_strcmp0(tag_buf, "s") == 0 || g_strcmp0(tag_buf, "strike") == 0
+                 || g_strcmp0(tag_buf, "del") == 0)
+            g_string_append(out, "~~");
+        else if (g_strcmp0(tag_buf, "br") == 0)
+            g_string_append_c(out, '\n');
+        else if (!closing && g_strcmp0(tag_buf, "font") == 0) {
+            /* Only convert monospace font to inline-code marker */
+            if (strstr(p, "monospace") && strstr(p, "monospace") < tag_end)
+                g_string_append_c(out, '`');
+            /* else: strip silently */
+        } else if (closing && g_strcmp0(tag_buf, "font") == 0) {
+            /* Heuristic: if we emitted a ` for the opening, emit closing `.
+             * We don't track open tags, so just emit ` unconditionally for
+             * </font> — works for the common single-code-span case. */
+            g_string_append_c(out, '`');
+        }
+        /* All other tags: strip silently */
+
+        p = tag_end + 1;
+    }
+
+    return g_string_free(out, FALSE);
+}
+
 /* Resolve Discord-style inline mentions in a message body.
  *
  * Replaces:
@@ -2072,7 +2173,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         gchar *url = g_strdup_printf("%s/channels/%s/messages",
                                      fd->api_base, fd->self_user_id);
         JsonObject *body_obj = json_object_new();
-        gchar *plain = purple_unescape_html(message);
+        gchar *plain = fluxer_html_to_discord(message);
         json_object_set_string_member(body_obj, "content", plain);
         gchar *body_str = json_object_to_string(body_obj);
         json_object_unref(body_obj);
@@ -2119,7 +2220,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         gchar *url = g_strdup_printf("%s/channels/%s/messages",
                                      fd->api_base, ch_id);
         JsonObject *body_obj = json_object_new();
-        gchar *plain = purple_unescape_html(message);
+        gchar *plain = fluxer_html_to_discord(message);
         json_object_set_string_member(body_obj, "content", plain);
         gchar *body_str = json_object_to_string(body_obj);
         json_object_unref(body_obj);
@@ -2143,7 +2244,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         sid->fd      = fd;
         sid->who     = g_strdup(who);
         sid->uid     = g_strdup(uid);
-        sid->message = purple_unescape_html(message);
+        sid->message = fluxer_html_to_discord(message);
 
         fluxer_http_request(fd, "POST", url, body_str,
                             fluxer_got_open_dm_cb, sid);
@@ -2176,7 +2277,7 @@ fluxer_send_chat(PurpleConnection *gc, int id,
     gchar *url = g_strdup_printf("%s/channels/%s/messages",
                                  fd->api_base, ch_id);
     JsonObject *body_obj = json_object_new();
-    gchar *plain = purple_unescape_html(message);
+    gchar *plain = fluxer_html_to_discord(message);
     json_object_set_string_member(body_obj, "content", plain);
     gchar *body_str = json_object_to_string(body_obj);
     json_object_unref(body_obj);
