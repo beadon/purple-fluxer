@@ -45,7 +45,7 @@
 #define FLUXER_PLUGIN_VERSION "0.1.0"
 #define FLUXER_PRPL_PROTOCOL  "fluxer"
 
-#define FLUXER_API_BASE       "https://api.fluxer.app/v1"
+#define FLUXER_API_BASE       "https://web.fluxer.app/api/v1"
 #define FLUXER_GATEWAY_HOST   "gateway.fluxer.app"
 #define FLUXER_GATEWAY_PORT   443
 #define FLUXER_GATEWAY_PATH   "/?v=1&encoding=json"
@@ -135,6 +135,9 @@ typedef struct {
 
     /* Login request state (used when email+password flow is in flight) */
     gboolean login_in_progress;
+
+    /* Configurable API base (from account Advanced settings) */
+    gchar *api_base;
 } FluxerData;
 
 /* ─── Forward declarations ────────────────────────────────────────────── */
@@ -189,6 +192,7 @@ fluxer_data_free(FluxerData *fd)
     g_hash_table_destroy(fd->dm_channels);
     g_hash_table_destroy(fd->chat_id_map);
 
+    g_free(fd->api_base);
     g_free(fd->token);
     g_free(fd->self_user_id);
     g_free(fd->self_username);
@@ -949,25 +953,23 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
     cbd->callback  = callback;
     cbd->user_data = user_data;
 
-    gchar *request = NULL;
-    gsize  request_len = 0;
+    /* Always build a raw request so Authorization is included on every call */
+    const gchar *host_start = url;
+    if      (g_str_has_prefix(url, "https://")) host_start = url + 8;
+    else if (g_str_has_prefix(url, "http://"))  host_start = url + 7;
 
-    /* For non-GET or requests with a body, build a raw HTTP request string */
-    if (body || g_strcmp0(method, "GET") != 0) {
-        /* Extract host and path from URL */
-        const gchar *host_start = url;
-        if      (g_str_has_prefix(url, "https://")) host_start = url + 8;
-        else if (g_str_has_prefix(url, "http://"))  host_start = url + 7;
+    const gchar *path_start = strchr(host_start, '/');
+    gchar *host = path_start
+        ? g_strndup(host_start, path_start - host_start)
+        : g_strdup(host_start);
+    const gchar *path = path_start ? path_start : "/";
 
-        const gchar *path_start = strchr(host_start, '/');
-        gchar *host = path_start
-            ? g_strndup(host_start, path_start - host_start)
-            : g_strdup(host_start);
-        const gchar *path = path_start ? path_start : "/";
+    gsize body_len = body ? strlen(body) : 0;
 
-        gsize body_len = body ? strlen(body) : 0;
-
-        gchar *headers = fd->token
+    /* Only include Content-Type / Content-Length when there is a body */
+    gchar *headers;
+    if (body) {
+        headers = fd->token
             ? g_strdup_printf(
                 "%s %s HTTP/1.0\r\n"
                 "Connection: close\r\n"
@@ -988,17 +990,35 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
                 "Content-Length: %" G_GSIZE_FORMAT "\r\n"
                 "\r\n",
                 method, path, host, FLUXER_USER_AGENT, body_len);
-
-        gsize headers_len = strlen(headers);
-        request_len = headers_len + body_len;
-        request = g_malloc(request_len + 1);
-        memcpy(request, headers, headers_len);
-        if (body) memcpy(request + headers_len, body, body_len);
-        request[request_len] = '\0';
-
-        g_free(headers);
-        g_free(host);
+    } else {
+        headers = fd->token
+            ? g_strdup_printf(
+                "%s %s HTTP/1.0\r\n"
+                "Connection: close\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Authorization: %s\r\n"
+                "\r\n",
+                method, path, host, FLUXER_USER_AGENT,
+                fluxer_auth_header(fd))
+            : g_strdup_printf(
+                "%s %s HTTP/1.0\r\n"
+                "Connection: close\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "\r\n",
+                method, path, host, FLUXER_USER_AGENT);
     }
+
+    gsize headers_len = strlen(headers);
+    gsize request_len = headers_len + body_len;
+    gchar *request = g_malloc(request_len + 1);
+    memcpy(request, headers, headers_len);
+    if (body) memcpy(request + headers_len, body, body_len);
+    request[request_len] = '\0';
+
+    g_free(headers);
+    g_free(host);
 
     purple_debug_info("fluxer", "HTTP %s %s (body_len=%" G_GSIZE_FORMAT ")\n",
                       method, url, request_len);
@@ -1036,6 +1056,15 @@ fluxer_got_gateway_url(FluxerData *fd, const gchar *body, gpointer user_data)
     }
 
     const gchar *ws_url = json_object_get_string_member(root, "url");
+    if (!ws_url) {
+        purple_debug_error("fluxer", "Gateway response missing 'url' field: %s\n",
+                           body);
+        purple_connection_error_reason(fd->gc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Gateway URL response missing url field");
+        json_object_unref(root);
+        return;
+    }
     purple_debug_info("fluxer", "Gateway URL: %s\n", ws_url);
 
     /* Parse "wss://hostname" — strip scheme, extract host */
@@ -1058,14 +1087,18 @@ fluxer_got_gateway_url(FluxerData *fd, const gchar *body, gpointer user_data)
     fluxer_ws_connect(fd);
 }
 
-/* Step 2: logged in, got token → fetch gateway URL */
+/* Step 2: logged in, got token → connect to gateway.
+ * /gateway/bot is a bot-only endpoint; user accounts connect directly
+ * to the well-known gateway host defined in FLUXER_GATEWAY_HOST. */
 static void
 fluxer_use_token(FluxerData *fd)
 {
-    gchar *url = g_strdup_printf("%s/gateway/bot", FLUXER_API_BASE);
-    purple_connection_update_progress(fd->gc, "Fetching gateway URL", 1, 3);
-    fluxer_http_request(fd, "GET", url, NULL, fluxer_got_gateway_url, NULL);
-    g_free(url);
+    purple_debug_info("fluxer", "Connecting to gateway %s:%d\n",
+                      FLUXER_GATEWAY_HOST, FLUXER_GATEWAY_PORT);
+    purple_connection_update_progress(fd->gc, "Connecting to gateway", 1, 3);
+    fd->ws_host = g_strdup(FLUXER_GATEWAY_HOST);
+    fd->ws_port = FLUXER_GATEWAY_PORT;
+    fluxer_ws_connect(fd);
 }
 
 /* Step 1a: got login response */
@@ -1114,6 +1147,11 @@ fluxer_login(PurpleAccount *account)
     FluxerData *fd = fluxer_data_new(gc);
     purple_connection_set_protocol_data(gc, fd);
 
+    const gchar *api_base_setting =
+        purple_account_get_string(account, "api_base", FLUXER_API_BASE);
+    fd->api_base = g_strdup((api_base_setting && *api_base_setting)
+                            ? api_base_setting : FLUXER_API_BASE);
+
     purple_connection_update_progress(gc, "Connecting", 0, 3);
 
     /* Prefer an explicitly stored token (e.g., bot token or saved session) */
@@ -1122,7 +1160,8 @@ fluxer_login(PurpleAccount *account)
 
     if (stored_token && *stored_token) {
         fd->token = g_strdup(stored_token);
-        purple_debug_info("fluxer", "Using stored token\n");
+        purple_debug_info("fluxer", "Using stored token (len=%zu prefix=%.8s...)\n",
+                          strlen(stored_token), stored_token);
         fluxer_use_token(fd);
         return;
     }
@@ -1144,7 +1183,7 @@ fluxer_login(PurpleAccount *account)
     gchar *body_str = json_object_to_string(body_obj);
     json_object_unref(body_obj);
 
-    gchar *url = g_strdup_printf("%s/auth/login", FLUXER_API_BASE);
+    gchar *url = g_strdup_printf("%s/auth/login", fd->api_base);
     purple_connection_update_progress(gc, "Authenticating", 0, 3);
     fluxer_http_request(fd, "POST", url, body_str,
                         fluxer_got_login_response, NULL);
@@ -1199,7 +1238,7 @@ fluxer_got_open_dm_cb(FluxerData *fd, const gchar *body, gpointer user_data)
     /* Cache dm_channel for this user */
     /* We need user_id; look it up from who in dm_channels by reverse scan */
     /* For now use the channel id directly */
-    gchar *url  = g_strdup_printf("%s/channels/%s/messages", FLUXER_API_BASE, ch_id);
+    gchar *url  = g_strdup_printf("%s/channels/%s/messages", fd->api_base, ch_id);
     JsonObject *msg_body = json_object_new();
     json_object_set_string_member(msg_body, "content", sid->message);
     gchar *msg_str = json_object_to_string(msg_body);
@@ -1253,7 +1292,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
             return -1;
         }
 
-        gchar *url = g_strdup_printf("%s/users/@me/channels", FLUXER_API_BASE);
+        gchar *url = g_strdup_printf("%s/users/@me/channels", fd->api_base);
         JsonObject *body_obj = json_object_new();
         json_object_set_string_member(body_obj, "recipient_id", uid);
         gchar *body_str = json_object_to_string(body_obj);
@@ -1272,7 +1311,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
     }
 
     gchar *url = g_strdup_printf("%s/channels/%s/messages",
-                                 FLUXER_API_BASE, ch_id);
+                                 fd->api_base, ch_id);
     JsonObject *body_obj = json_object_new();
     gchar *plain = purple_unescape_html(message);
     json_object_set_string_member(body_obj, "content", plain);
@@ -1307,7 +1346,7 @@ fluxer_send_chat(PurpleConnection *gc, int id,
     if (!ch_id) return -1;
 
     gchar *url = g_strdup_printf("%s/channels/%s/messages",
-                                 FLUXER_API_BASE, ch_id);
+                                 fd->api_base, ch_id);
     JsonObject *body_obj = json_object_new();
     gchar *plain = purple_unescape_html(message);
     json_object_set_string_member(body_obj, "content", plain);
@@ -1451,7 +1490,7 @@ fluxer_account_options(void)
 /* ─── Plugin info and registration ───────────────────────────────────── */
 
 static PurplePluginProtocolInfo prpl_info = {
-    0,                              /* options */
+    OPT_PROTO_PASSWORD_OPTIONAL,    /* options */
     NULL,                           /* user_splits */
     NULL,                           /* protocol_options (set in plugin_init) */
     NO_BUDDY_ICONS,                 /* icon_spec */
