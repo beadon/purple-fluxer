@@ -136,7 +136,8 @@ typedef struct {
     GHashTable *oldest_msg_id;     /* channel_id (str) -> oldest message snowflake (str) */
     GHashTable *read_states;       /* channel_id (str) -> last_read_msg_id (str): from READY */
     GHashTable *channel_last_msg;  /* channel_id (str) -> last_message_id (str): newest in channel */
-    GHashTable *guild_members;     /* guild_id (str)   -> GList* of gchar* usernames */
+    GHashTable *guild_members;       /* guild_id (str)   -> GList* of gchar* usernames */
+    GHashTable *dm_history_fetched;  /* channel_id (str) -> 1: DMs already history-fetched */
     gint        next_chat_id;
 
     /* HTTP pending requests (PurpleHttpConnection*) */
@@ -164,6 +165,10 @@ static void fluxer_http_request(FluxerData *fd, const gchar *method,
                                 const gchar *url, const gchar *body,
                                 void (*callback)(FluxerData *, const gchar *, gpointer),
                                 gpointer user_data);
+static void fluxer_fetch_dm_history(FluxerData *fd, const gchar *channel_id,
+                                    const gchar *dm_username);
+static void fluxer_conversation_created_cb(PurpleConversation *conv, gpointer user_data);
+static const gchar *fluxer_uid_for_buddy(FluxerData *fd, const gchar *who);
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -194,6 +199,7 @@ fluxer_data_new(PurpleConnection *gc)
     fd->channel_last_msg = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->guild_members    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                free_string_list);
+    fd->dm_history_fetched = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     fd->next_chat_id     = 1;
     return fd;
 }
@@ -228,6 +234,7 @@ fluxer_data_free(FluxerData *fd)
     g_hash_table_destroy(fd->read_states);
     g_hash_table_destroy(fd->channel_last_msg);
     g_hash_table_destroy(fd->guild_members);
+    g_hash_table_destroy(fd->dm_history_fetched);
 
     g_free(fd->api_base);
     g_free(fd->token);
@@ -449,7 +456,12 @@ ws_process_recv_buf(FluxerData *fd)
 
         /* Handle control frames inline */
         if (opcode == WS_OP_CLOSE) {
-            purple_debug_info("fluxer", "WebSocket CLOSE received\n");
+            guint16 close_code = 0;
+            if (payload_len >= 2)
+                close_code = ((guint8)buf->str[offset] << 8)
+                           |  (guint8)buf->str[offset + 1];
+            purple_debug_info("fluxer",
+                "WebSocket CLOSE received (code=%u)\n", close_code);
             /* Attempt reconnect */
             purple_connection_error_reason(fd->gc,
                 PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
@@ -771,6 +783,15 @@ handle_ready(FluxerData *fd, JsonObject *d)
             JsonObject *ch = json_array_get_object_element(dms, i);
             const gchar *ch_id = json_object_get_string_member(ch, "id");
 
+            /* Store last_message_id for unread detection */
+            if (json_object_has_member(ch, "last_message_id") &&
+                !json_node_is_null(json_object_get_member(ch, "last_message_id"))) {
+                const gchar *lmid = json_object_get_string_member(ch, "last_message_id");
+                if (lmid)
+                    g_hash_table_insert(fd->channel_last_msg,
+                                        g_strdup(ch_id), g_strdup(lmid));
+            }
+
             /* For 1-on-1 DMs the recipients array has one entry */
             if (json_object_has_member(ch, "recipients")) {
                 JsonArray *recs = json_object_get_array_member(ch, "recipients");
@@ -828,6 +849,40 @@ handle_ready(FluxerData *fd, JsonObject *d)
 
     /* Mark blist chat nodes as unread where channel has newer messages */
     fluxer_blist_apply_unread(fd);
+
+    /* DM history on login — behaviour controlled by account preference */
+    const gchar *dm_mode = purple_account_get_string(
+        fd->account, "dm_history_mode", "auto");
+
+    if (g_strcmp0(dm_mode, "open") == 0) {
+        /* Fetch and open windows for all unread DMs immediately */
+        GHashTableIter it;
+        gpointer k, v;
+        g_hash_table_iter_init(&it, fd->dm_channels);
+        while (g_hash_table_iter_next(&it, &k, &v)) {
+            const gchar *uid   = (const gchar *)k;
+            const gchar *ch_id = (const gchar *)v;
+            const gchar *last_msg  = g_hash_table_lookup(fd->channel_last_msg, ch_id);
+            const gchar *last_read = g_hash_table_lookup(fd->read_states, ch_id);
+            if (!fluxer_snowflake_gt(last_msg, last_read)) continue;
+            const gchar *username = g_hash_table_lookup(fd->user_names, uid);
+            if (!username) continue;
+            fluxer_fetch_dm_history(fd, ch_id, username);
+        }
+    } else if (g_strcmp0(dm_mode, "auto") == 0) {
+        /* Fetch history silently the first time each DM conversation is opened */
+        purple_debug_info("fluxer",
+            "DM history: auto mode — connecting conversation-created signal\n");
+        purple_signal_connect(purple_conversations_get_handle(),
+                              "conversation-created", fd->gc,
+                              PURPLE_CALLBACK(fluxer_conversation_created_cb), fd);
+        /* Also catch any IM windows that Pidgin restored before READY was processed */
+        for (GList *l = purple_get_conversations(); l; l = l->next)
+            fluxer_conversation_created_cb((PurpleConversation *)l->data, fd);
+    } else {
+        purple_debug_info("fluxer", "DM history: mode='%s' — no action\n", dm_mode);
+    }
+    /* "off": do nothing — user can use /more manually */
 
     purple_connection_set_state(fd->gc, PURPLE_CONNECTED);
     purple_connection_update_progress(fd->gc, "Connected", 3, 3);
@@ -2444,6 +2499,11 @@ fluxer_close(PurpleConnection *gc)
     FluxerData *fd = purple_connection_get_protocol_data(gc);
     if (!fd) return;
 
+    /* Disconnect conversation-created signal if connected (auto DM history mode) */
+    purple_signal_disconnect(purple_conversations_get_handle(),
+                             "conversation-created", gc,
+                             PURPLE_CALLBACK(fluxer_conversation_created_cb));
+
     /* Send WS close frame */
     if (fd->ssl && fd->ws_handshake_done) {
         guint8 close_code[2] = {0x03, 0xE8};  /* 1000 Normal Closure */
@@ -2708,7 +2768,8 @@ parse_timestamp(const gchar *ts)
 typedef struct {
     FluxerData *fd;
     gchar      *channel_id;
-    gint        chat_id;
+    gint        chat_id;        /* guild chat ID; 0 for DMs */
+    gchar      *dm_username;    /* non-NULL for DM fetches: the other user's display name */
     gboolean    show_separator; /* TRUE for /more fetches; FALSE for initial join load */
 } HistoryFetchData;
 
@@ -2760,7 +2821,17 @@ fluxer_got_history_cb(FluxerData *fd, const gchar *body, gpointer user_data)
         g_free(header);
     }
 
-    /* Replay oldest-first into the chat window */
+    /* Replay oldest-first into the conversation window */
+    PurpleConversation *dm_conv = NULL;
+    if (hfd->dm_username) {
+        /* Find or create the IM conversation so we can write both sides */
+        dm_conv = purple_find_conversation_with_account(
+            PURPLE_CONV_TYPE_IM, hfd->dm_username, fd->account);
+        if (!dm_conv)
+            dm_conv = purple_conversation_new(
+                PURPLE_CONV_TYPE_IM, fd->account, hfd->dm_username);
+    }
+
     for (gint i = (gint)n - 1; i >= 0; i--) {
         JsonObject *msg      = json_array_get_object_element(msgs, i);
         const gchar *content = json_object_get_string_member(msg, "content");
@@ -2775,9 +2846,19 @@ fluxer_got_history_cb(FluxerData *fd, const gchar *body, gpointer user_data)
         g_hash_table_insert(fd->user_names,
                             g_strdup(author_id), g_strdup(username));
 
-        serv_got_chat_in(fd->gc, hfd->chat_id, username,
-                         PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
-                         content, ts);
+        if (dm_conv) {
+            /* DM: write both sides correctly — sent and received */
+            gboolean from_self = (g_strcmp0(author_id, fd->self_user_id) == 0);
+            PurpleMessageFlags flags = (from_self ? PURPLE_MESSAGE_SEND
+                                                  : PURPLE_MESSAGE_RECV)
+                                       | PURPLE_MESSAGE_DELAYED;
+            purple_conv_im_write(PURPLE_CONV_IM(dm_conv), username,
+                                 content, flags, ts);
+        } else {
+            serv_got_chat_in(fd->gc, hfd->chat_id, username,
+                             PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
+                             content, ts);
+        }
     }
 
     if (hfd->show_separator)
@@ -2796,7 +2877,59 @@ fluxer_got_history_cb(FluxerData *fd, const gchar *body, gpointer user_data)
 
 done:
     g_free(hfd->channel_id);
+    g_free(hfd->dm_username);
     g_free(hfd);
+}
+
+static void
+fluxer_fetch_dm_history(FluxerData *fd, const gchar *channel_id,
+                        const gchar *dm_username)
+{
+    if (g_hash_table_lookup(fd->dm_history_fetched, channel_id)) return;
+    g_hash_table_insert(fd->dm_history_fetched,
+                        g_strdup(channel_id), GINT_TO_POINTER(1));
+
+    gchar *url = g_strdup_printf("%s/channels/%s/messages?limit=50",
+                                 fd->api_base, channel_id);
+    HistoryFetchData *hfd = g_new0(HistoryFetchData, 1);
+    hfd->fd           = fd;
+    hfd->channel_id   = g_strdup(channel_id);
+    hfd->dm_username  = g_strdup(dm_username);
+    hfd->chat_id      = 0;
+    hfd->show_separator = FALSE;
+    fluxer_http_request(fd, "GET", url, NULL, fluxer_got_history_cb, hfd);
+    g_free(url);
+}
+
+/* Signal handler for "auto" DM history mode: fires when any IM conversation
+ * window is created (whether by incoming message or user action). */
+static void
+fluxer_conversation_created_cb(PurpleConversation *conv, gpointer user_data)
+{
+    FluxerData *fd = user_data;
+    if (purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_IM) return;
+    if (purple_conversation_get_account(conv) != fd->account) return;
+
+    const gchar *name = purple_conversation_get_name(conv);
+    purple_debug_info("fluxer", "DM history: conversation-created for '%s'\n", name);
+
+    /* Reverse-lookup: find user_id for this username, then channel_id */
+    const gchar *uid = fluxer_uid_for_buddy(fd, name);
+    if (!uid) {
+        purple_debug_info("fluxer",
+            "DM history: no uid for '%s' — skipping\n", name);
+        return;
+    }
+    const gchar *ch_id = g_hash_table_lookup(fd->dm_channels, uid);
+    if (!ch_id) {
+        purple_debug_info("fluxer",
+            "DM history: no dm channel for uid %s ('%s') — skipping\n", uid, name);
+        return;
+    }
+
+    purple_debug_info("fluxer",
+        "DM history: fetching for '%s' ch=%s\n", name, ch_id);
+    fluxer_fetch_dm_history(fd, ch_id, name);
 }
 
 /* ─── Chat (guild channel) ops ────────────────────────────────────────── */
@@ -3029,6 +3162,25 @@ fluxer_account_options(void)
     opt = purple_account_option_string_new(
         "API base URL (for self-hosted instances)",
         "api_base", FLUXER_API_BASE);
+    opts = g_list_append(opts, opt);
+
+    /* DM history on login */
+    GList *choices = NULL;
+    PurpleKeyValuePair *p;
+    p = g_new0(PurpleKeyValuePair, 1);
+    p->key = g_strdup("Fetch when conversation opens (recommended)");
+    p->value = g_strdup("auto");
+    choices = g_list_append(choices, p);
+    p = g_new0(PurpleKeyValuePair, 1);
+    p->key = g_strdup("Fetch and open all unread DMs on login");
+    p->value = g_strdup("open");
+    choices = g_list_append(choices, p);
+    p = g_new0(PurpleKeyValuePair, 1);
+    p->key = g_strdup("Off (use /more manually)");
+    p->value = g_strdup("off");
+    choices = g_list_append(choices, p);
+    opt = purple_account_option_list_new("DM history on login",
+                                         "dm_history_mode", choices);
     opts = g_list_append(opts, opt);
 
     return opts;

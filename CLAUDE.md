@@ -217,7 +217,25 @@ Features not yet implemented (contributions welcome):
 - **Reactions display** — show emoji reaction counts on messages
 - **MFA / TOTP login** — 6-digit TOTP code entry after email+password
 - **`@everyone` / `@here` highlight** — add `PURPLE_MESSAGE_NICK` when message contains these strings
-- **DM history on login** — DM channels are not fetched/replayed on connect; unread DMs are invisible until a new message arrives. Should fetch last N messages for each DM channel in the READY payload's `private_channels` list, same as guild channel history on `fluxer_join_chat`
+- **DM history on login** — implemented: user-configurable dropdown (`dm_history_mode`: auto/open/off). `auto` fetches history when IM window opens via `conversation-created` signal; `open` fetches all unread DMs at READY time. Deduped via `dm_history_fetched` hash.
+- **Friend requests** — READY payload `relationships` array contains pending requests (type values map to friend/pending/blocked). Need incoming request notification + accept/deny UI (likely via `purple_request_action`)
+- **Open DMs persistence** — `private_channels` in READY represents the user's persistent DM list. Should restore open DM conversations across sessions and show unread indicators on buddy entries
+- **Slash commands** — extend `fluxer_handle_slash_cmd` with the following guild/channel operations:
+  - `/nick <new_nickname>` — PATCH `/guilds/{guild_id}/members/@me` with `nick` field
+  - `/kick <username>` — DELETE `/guilds/{guild_id}/members/{user_id}`
+  - `/ban <username>` — PUT `/guilds/{guild_id}/bans/{user_id}`
+  - `/leave` / `/part` — DELETE `/users/@me/guilds/{guild_id}`
+  - `/pinned` — GET `/channels/{id}/pins`, display each pinned message as a notice
+  - `/roles` — GET `/guilds/{guild_id}/roles`, list role names as notices
+  - `/threads` — GET `/channels/{id}/threads/active`, list thread names/IDs
+  - `/thread <timestamp> <message>` — POST to thread channel by timestamp lookup
+  - `/react <timestamp> <emoji>` — PUT `/channels/{id}/reactions/{emoji}/{message_id}/@me`
+  - `/unreact <timestamp> <emoji>` — DELETE `/channels/{id}/reactions/{emoji}/{message_id}/@me`
+  - `/reply <timestamp> <message>` — POST message with `message_reference.message_id` set
+  - `/threadhistory` / `/thist <timestamp>` — fetch thread message history
+  - `/grabhistory` / `/hist` — fetch full channel history (paginate until exhausted; warn on large channels)
+  - `/servername` — display current guild name from `guild_names` map
+  - `/joinserver <invite_code_or_url>` — POST `/invites/{code}` to join a guild
 
 ---
 
