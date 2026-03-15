@@ -1692,14 +1692,30 @@ fluxer_got_open_dm_cb(FluxerData *fd, const gchar *body, gpointer user_data)
     JsonObject *root = string_to_json_object(body);
     if (!root) { g_free(sid->who); g_free(sid->uid); g_free(sid->message); g_free(sid); return; }
 
-    /* Error response — report to user and bail */
+    /* Error response — write a notice into the conversation, no popup */
     if (json_object_has_member(root, "code")) {
-        const gchar *errmsg = json_object_has_member(root, "message")
-            ? json_object_get_string_member(root, "message")
-            : "Could not open DM channel";
-        purple_notify_error(fd->gc, "Fluxer", errmsg, NULL);
+        /* Prefer errors[0].message over the generic top-level message */
+        const gchar *errmsg = NULL;
+        if (json_object_has_member(root, "errors")) {
+            JsonArray *errs = json_object_get_array_member(root, "errors");
+            if (errs && json_array_get_length(errs) > 0) {
+                JsonObject *e = json_array_get_object_element(errs, 0);
+                if (e) errmsg = json_object_get_string_member(e, "message");
+            }
+        }
+        if (!errmsg)
+            errmsg = json_object_has_member(root, "message")
+                ? json_object_get_string_member(root, "message")
+                : "Could not open DM channel";
+
         purple_debug_warning("fluxer", "open DM for %s failed: %s\n",
                              sid->who, errmsg);
+        PurpleConversation *conv = purple_find_conversation_with_account(
+            PURPLE_CONV_TYPE_IM, sid->who, fd->account);
+        if (conv)
+            purple_conversation_write(conv, NULL, errmsg,
+                PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LOG, time(NULL));
+
         json_object_unref(root);
         g_free(sid->who); g_free(sid->uid); g_free(sid->message); g_free(sid);
         return;
