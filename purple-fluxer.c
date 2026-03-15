@@ -787,15 +787,18 @@ handle_message_create(FluxerData *fd, JsonObject *d)
         if (is_self) return;
         serv_got_im(fd->gc, username, content, PURPLE_MESSAGE_RECV, ts);
     } else {
-        /* Guild channel — pass self-echo through with SEND flag so sent
-         * messages appear in the conversation window */
+        /* Guild channel — gateway echo is the display path for all messages,
+         * including our own (libpurple does not auto-echo for chats).
+         * OPT_PROTO_UNIQUE_CHATNAME ensures the 'who' name is used verbatim
+         * even for PURPLE_MESSAGE_SEND, so self-messages show "beadon" not
+         * the login email. */
         gpointer chat_id_ptr =
             g_hash_table_lookup(fd->chat_id_map, channel_id);
         if (chat_id_ptr) {
             gint chat_id = GPOINTER_TO_INT(chat_id_ptr);
-            PurpleMessageFlags flags =
+            PurpleMessageFlags mflags =
                 is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
-            serv_got_chat_in(fd->gc, chat_id, username, flags, content, ts);
+            serv_got_chat_in(fd->gc, chat_id, username, mflags, content, ts);
         }
     }
 }
@@ -2205,7 +2208,10 @@ fluxer_account_options(void)
 /* ─── Plugin info and registration ───────────────────────────────────── */
 
 static PurplePluginProtocolInfo prpl_info = {
-    OPT_PROTO_PASSWORD_OPTIONAL,    /* options */
+    OPT_PROTO_PASSWORD_OPTIONAL |
+    OPT_PROTO_UNIQUE_CHATNAME,      /* options: chat room names are authoritative;
+                                     * libpurple must not substitute the account
+                                     * alias/email for PURPLE_MESSAGE_SEND. */
     NULL,                           /* user_splits */
     NULL,                           /* protocol_options (set in plugin_init) */
     NO_BUDDY_ICONS,                 /* icon_spec */

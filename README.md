@@ -26,17 +26,25 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | `/more` command — paginate older history | ✅ |
 | Message edit notifications (`MESSAGE_UPDATE`) | ✅ |
 | Message delete notifications (`MESSAGE_DELETE`) | ✅ |
-| Guild member list in chat room | ✅ (via `REQUEST_GUILD_MEMBERS`) |
+| Guild member list in chat room | ✅ (via REST `GET /guilds/{id}/members`) |
 | Presence / status sync (`PRESENCE_UPDATE`) | ✅ |
 | Set own presence (online/idle/dnd/invisible) | ✅ |
 | Guild channel room list | ✅ |
 | Self-hosted instance support | ✅ (set API base in Advanced) |
+| Open DM from guild member list | ✅ |
+| Personal notes channel (type 999) | ✅ |
+| Correct sender name in guild chat | ✅ (`OPT_PROTO_UNIQUE_CHATNAME`) |
+| Markdown rendering (bold/italic/code/strikethrough) | ❌ (TODO) |
+| Mention resolution (`<@id>` → username, `<#id>` → channel) | ❌ (TODO) |
+| Message reply context | ❌ (TODO) |
+| File attachments (links + inline images) | ❌ (TODO) |
 | Buddy avatars | ❌ (TODO) |
-| File attachments | ❌ (TODO) |
 | Typing indicator send | ❌ (stub — needs channel lookup) |
 | Typing indicator receive | ❌ (stub — needs user_id→name index) |
+| `GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE` live updates | ❌ (TODO) |
+| Reactions display | ❌ (TODO) |
+| MFA / TOTP login | ❌ (TODO) |
 | Voice/video | ❌ (out of scope for libpurple) |
-| MFA login | ❌ (TODO) |
 
 ---
 
@@ -138,6 +146,10 @@ contribution targets:
    the bottom; history pages appear below live messages rather than above.
 4. **Protocol UI hints** — no API for a plugin to suggest default window
    behaviours (e.g. hide the participant list by default for large guilds).
+5. **Per-guild display names (server nicknames)** — Discord-compatible platforms
+   support a per-server nickname distinct from the global username. libpurple
+   buddies have a single global alias; `get_cb_alias` has no room/guild context
+   parameter, so per-guild overrides cannot be implemented at the plugin level.
 
 ---
 
