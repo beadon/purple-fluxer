@@ -157,6 +157,10 @@ static void fluxer_handle_dispatch(FluxerData *fd, const gchar *event_name, Json
 static const gchar *fluxer_list_icon(PurpleAccount *account, PurpleBuddy *buddy);
 static void handle_guild_create(FluxerData *fd, JsonObject *d);
 static void fluxer_request_guild_members(FluxerData *fd, const gchar *guild_id);
+static void fluxer_http_request(FluxerData *fd, const gchar *method,
+                                const gchar *url, const gchar *body,
+                                void (*callback)(FluxerData *, const gchar *, gpointer),
+                                gpointer user_data);
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -1117,21 +1121,112 @@ handle_guild_create(FluxerData *fd, JsonObject *d)
     fluxer_request_guild_members(fd, guild_id);
 }
 
+/* Populate guild members by sharing the core logic used by both the REST
+ * callback and handle_guild_members_chunk.  new_names ownership is taken. */
+static void
+fluxer_apply_guild_members(FluxerData *fd, const gchar *guild_id,
+                            GList *new_names)
+{
+    guint n = g_list_length(new_names);
+    if (n == 0) return;
+
+    /* Push into any open chat windows for this guild */
+    GHashTableIter iter;
+    gpointer k, v;
+    g_hash_table_iter_init(&iter, fd->chat_id_map);
+    while (g_hash_table_iter_next(&iter, &k, &v)) {
+        const gchar *ch_id   = (const gchar *)k;
+        gint         chat_id = GPOINTER_TO_INT(v);
+        const gchar *ch_guild = g_hash_table_lookup(fd->channel_to_guild, ch_id);
+        if (g_strcmp0(ch_guild, guild_id) != 0) continue;
+
+        PurpleConversation *conv = purple_find_chat(fd->gc, chat_id);
+        if (!conv) continue;
+
+        GList *flags = NULL;
+        for (GList *l = new_names; l; l = l->next)
+            flags = g_list_prepend(flags, GINT_TO_POINTER(PURPLE_CBFLAGS_NONE));
+        purple_conv_chat_add_users(PURPLE_CONV_CHAT(conv),
+                                   new_names, NULL, flags, FALSE);
+        g_list_free(flags);
+    }
+
+    /* Merge into guild_members (steal to avoid double-free on existing list) */
+    GList *existing = g_hash_table_lookup(fd->guild_members, guild_id);
+    if (existing)
+        g_hash_table_steal(fd->guild_members, guild_id);
+    g_hash_table_insert(fd->guild_members, g_strdup(guild_id),
+                        g_list_concat(new_names, existing));
+
+    purple_debug_info("fluxer",
+        "guild_members: applied %u members for guild %s\n", n, guild_id);
+}
+
+static void
+fluxer_got_guild_members_cb(FluxerData *fd, const gchar *body, gpointer user_data)
+{
+    gchar *guild_id = (gchar *)user_data;
+
+    if (!body || *body == '\0') {
+        purple_debug_warning("fluxer",
+            "GET /guilds/%s/members: empty response\n", guild_id);
+        g_free(guild_id);
+        return;
+    }
+
+    /* Response is a JSON array of guild member objects */
+    JsonParser *parser = json_parser_new();
+    GError *err = NULL;
+    if (!json_parser_load_from_data(parser, body, -1, &err)) {
+        purple_debug_error("fluxer",
+            "GET /guilds/%s/members: parse error: %s\n",
+            guild_id, err->message);
+        g_error_free(err);
+        g_object_unref(parser);
+        g_free(guild_id);
+        return;
+    }
+
+    JsonNode *root_node = json_parser_get_root(parser);
+    if (!JSON_NODE_HOLDS_ARRAY(root_node)) {
+        purple_debug_warning("fluxer",
+            "GET /guilds/%s/members: response is not an array\n", guild_id);
+        g_object_unref(parser);
+        g_free(guild_id);
+        return;
+    }
+
+    JsonArray *arr = json_node_get_array(root_node);
+    guint n = json_array_get_length(arr);
+
+    GList *names = NULL;
+    for (guint i = 0; i < n; i++) {
+        JsonObject *m    = json_array_get_object_element(arr, i);
+        JsonObject *user = json_object_has_member(m, "user")
+                         ? json_object_get_object_member(m, "user") : NULL;
+        if (!user) continue;
+        const gchar *uname = json_object_get_string_member(user, "username");
+        const gchar *uid   = json_object_get_string_member(user, "id");
+        if (uname && uid) {
+            names = g_list_prepend(names, g_strdup(uname));
+            g_hash_table_insert(fd->user_names, g_strdup(uid), g_strdup(uname));
+        }
+    }
+
+    g_object_unref(parser);
+    fluxer_apply_guild_members(fd, guild_id, names);
+    g_free(guild_id);
+}
+
 static void
 fluxer_request_guild_members(FluxerData *fd, const gchar *guild_id)
 {
-    JsonObject *d = json_object_new();
-    json_object_set_string_member(d, "guild_id", guild_id);
-    json_object_set_string_member(d, "query", "");
-    json_object_set_int_member   (d, "limit", 0);
-
-    JsonObject *payload = json_object_new();
-    json_object_set_int_member   (payload, "op", OP_REQUEST_MEMBERS);
-    json_object_set_object_member(payload, "d",  d);
-
-    fluxer_ws_send_json(fd, payload);
-    json_object_unref(payload);
-    purple_debug_info("fluxer", "Sent REQUEST_GUILD_MEMBERS for %s\n", guild_id);
+    gchar *url = g_strdup_printf("%s/guilds/%s/members?limit=1000",
+                                 fd->api_base, guild_id);
+    purple_debug_info("fluxer", "Fetching guild members: %s\n", url);
+    fluxer_http_request(fd, "GET", url, NULL,
+                        fluxer_got_guild_members_cb, g_strdup(guild_id));
+    g_free(url);
 }
 
 static void
@@ -1148,7 +1243,6 @@ handle_guild_members_chunk(FluxerData *fd, JsonObject *d)
     JsonArray *members_arr = json_object_get_array_member(d, "members");
     guint n = json_array_get_length(members_arr);
 
-    /* Build list of new usernames from this chunk */
     GList *new_names = NULL;
     for (guint i = 0; i < n; i++) {
         JsonObject *m    = json_array_get_object_element(members_arr, i);
@@ -1163,37 +1257,10 @@ handle_guild_members_chunk(FluxerData *fd, JsonObject *d)
         }
     }
 
-    /* Add chunk members to any open chat windows for this guild */
-    GHashTableIter iter;
-    gpointer k, v;
-    g_hash_table_iter_init(&iter, fd->chat_id_map);
-    while (g_hash_table_iter_next(&iter, &k, &v)) {
-        const gchar *ch_id   = k;
-        gint         chat_id = GPOINTER_TO_INT(v);
-        const gchar *ch_guild = g_hash_table_lookup(fd->channel_to_guild, ch_id);
-        if (g_strcmp0(ch_guild, guild_id) != 0) continue;
-
-        PurpleConversation *conv = purple_find_chat(fd->gc, chat_id);
-        if (!conv) continue;
-
-        GList *flags = NULL;
-        for (GList *l = new_names; l; l = l->next)
-            flags = g_list_prepend(flags, GINT_TO_POINTER(PURPLE_CBFLAGS_NONE));
-        purple_conv_chat_add_users(PURPLE_CONV_CHAT(conv),
-                                   new_names, NULL, flags, FALSE);
-        g_list_free(flags);
-    }
-
-    /* Merge chunk into guild_members: steal existing list to avoid double-free */
-    GList *existing = g_hash_table_lookup(fd->guild_members, guild_id);
-    if (existing)
-        g_hash_table_steal(fd->guild_members, guild_id);
-    GList *combined = g_list_concat(new_names, existing);
-    g_hash_table_insert(fd->guild_members, g_strdup(guild_id), combined);
-
     purple_debug_info("fluxer",
         "GUILD_MEMBERS_CHUNK: guild %s chunk %d/%d, %u members\n",
         guild_id, chunk_index + 1, chunk_count, n);
+    fluxer_apply_guild_members(fd, guild_id, new_names);
 }
 
 static void
