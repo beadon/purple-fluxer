@@ -36,6 +36,7 @@
 #include <roomlist.h>
 #include <server.h>
 #include <sslconn.h>
+#include <cmds.h>
 #include <util.h>
 #include <version.h>
 
@@ -126,8 +127,13 @@ typedef struct {
     /* Channel/guild bookkeeping */
     GHashTable *channel_to_guild;  /* channel_id (str) -> guild_id (str), NULL for DMs */
     GHashTable *channel_names;     /* channel_id (str) -> name (str) */
+    GHashTable *guild_names;       /* guild_id (str)   -> name (str) */
     GHashTable *dm_channels;       /* user_id (str)    -> channel_id (str) */
     GHashTable *chat_id_map;       /* channel_id (str) -> int chat_id */
+    GHashTable *seeded_channels;   /* channel_id (str) -> 1: session dedup for blist */
+    GHashTable *user_names;        /* user_id (str)    -> username (str) */
+    GHashTable *oldest_msg_id;     /* channel_id (str) -> oldest message snowflake (str) */
+    GHashTable *guild_members;     /* guild_id (str)   -> GList* of gchar* usernames */
     gint        next_chat_id;
 
     /* HTTP pending requests (PurpleHttpConnection*) */
@@ -144,12 +150,21 @@ typedef struct {
 
 static void fluxer_ws_connect(FluxerData *fd);
 static void fluxer_ws_send_json(FluxerData *fd, JsonObject *obj);
+static void fluxer_ws_send_heartbeat_payload(FluxerData *fd);
 static void fluxer_gateway_send_identify(FluxerData *fd);
 static void fluxer_gateway_send_heartbeat(FluxerData *fd);
 static void fluxer_handle_dispatch(FluxerData *fd, const gchar *event_name, JsonObject *d);
 static const gchar *fluxer_list_icon(PurpleAccount *account, PurpleBuddy *buddy);
+static void handle_guild_create(FluxerData *fd, JsonObject *d);
+static void fluxer_request_guild_members(FluxerData *fd, const gchar *guild_id);
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
+
+static void
+free_string_list(gpointer data)
+{
+    g_list_free_full((GList *)data, g_free);
+}
 
 static FluxerData *
 fluxer_data_new(PurpleConnection *gc)
@@ -162,8 +177,14 @@ fluxer_data_new(PurpleConnection *gc)
     fd->ws_frame_buf    = g_string_new(NULL);
     fd->channel_to_guild = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->channel_names    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->guild_names      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->dm_channels      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->chat_id_map      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->seeded_channels  = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    fd->user_names       = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->oldest_msg_id    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->guild_members    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                               free_string_list);
     fd->next_chat_id     = 1;
     return fd;
 }
@@ -189,8 +210,13 @@ fluxer_data_free(FluxerData *fd)
 
     g_hash_table_destroy(fd->channel_to_guild);
     g_hash_table_destroy(fd->channel_names);
+    g_hash_table_destroy(fd->guild_names);
     g_hash_table_destroy(fd->dm_channels);
     g_hash_table_destroy(fd->chat_id_map);
+    g_hash_table_destroy(fd->seeded_channels);
+    g_hash_table_destroy(fd->user_names);
+    g_hash_table_destroy(fd->oldest_msg_id);
+    g_hash_table_destroy(fd->guild_members);
 
     g_free(fd->api_base);
     g_free(fd->token);
@@ -476,8 +502,10 @@ ws_process_recv_buf(FluxerData *fd)
                 break;
 
             case OP_HEARTBEAT:
-                /* Server requesting heartbeat immediately */
-                fluxer_gateway_send_heartbeat(fd);
+                /* Server requesting an immediate heartbeat (pure pong).
+                 * Respond directly without touching hb_ack_received — the
+                 * regular timer cycle manages ACK state independently. */
+                fluxer_ws_send_heartbeat_payload(fd);
                 break;
 
             case OP_RECONNECT:
@@ -554,11 +582,11 @@ fluxer_heartbeat_cb(gpointer data)
     return TRUE;  /* keep firing */
 }
 
+/* Send a raw heartbeat payload without touching hb_ack_received.
+ * Used both by the regular timer cycle and to respond to server op:1 requests. */
 static void
-fluxer_gateway_send_heartbeat(FluxerData *fd)
+fluxer_ws_send_heartbeat_payload(FluxerData *fd)
 {
-    fd->hb_ack_received = FALSE;
-
     JsonObject *payload = json_object_new();
     json_object_set_int_member(payload, "op", OP_HEARTBEAT);
     if (fd->sequence >= 0)
@@ -568,6 +596,13 @@ fluxer_gateway_send_heartbeat(FluxerData *fd)
 
     fluxer_ws_send_json(fd, payload);
     json_object_unref(payload);
+}
+
+static void
+fluxer_gateway_send_heartbeat(FluxerData *fd)
+{
+    fd->hb_ack_received = FALSE;
+    fluxer_ws_send_heartbeat_payload(fd);
 
     /* Schedule the repeating heartbeat timer after first send */
     if (!fd->hb_timer && fd->hb_interval_ms > 0) {
@@ -654,6 +689,18 @@ handle_ready(FluxerData *fd, JsonObject *d)
         "READY: logged in as %s (%s), session=%s\n",
         uname, id, fd->session_id);
 
+    /* Seed user_id → username map from the users array in READY */
+    if (json_object_has_member(d, "users")) {
+        JsonArray *users = json_object_get_array_member(d, "users");
+        for (guint i = 0; i < json_array_get_length(users); i++) {
+            JsonObject *u   = json_array_get_object_element(users, i);
+            const gchar *uid  = json_object_get_string_member(u, "id");
+            const gchar *un   = json_object_get_string_member(u, "username");
+            if (uid && un)
+                g_hash_table_insert(fd->user_names, g_strdup(uid), g_strdup(un));
+        }
+    }
+
     /* Walk DM channels sent in READY */
     if (json_object_has_member(d, "private_channels")) {
         JsonArray *dms = json_object_get_array_member(d, "private_channels");
@@ -686,6 +733,18 @@ handle_ready(FluxerData *fd, JsonObject *d)
         }
     }
 
+    /* Walk guilds included in READY — seeds buddy list groups */
+    if (json_object_has_member(d, "guilds")) {
+        JsonArray *guilds = json_object_get_array_member(d, "guilds");
+        guint ng = json_array_get_length(guilds);
+        for (guint i = 0; i < ng; i++) {
+            JsonObject *guild = json_array_get_object_element(guilds, i);
+            if (json_object_has_member(guild, "channels"))
+                handle_guild_create(fd, guild);
+        }
+        purple_debug_info("fluxer", "READY: processed %u guilds\n", ng);
+    }
+
     purple_connection_set_state(fd->gc, PURPLE_CONNECTED);
     purple_connection_update_progress(fd->gc, "Connected", 3, 3);
 }
@@ -701,6 +760,9 @@ handle_message_create(FluxerData *fd, JsonObject *d)
     JsonObject *author  = json_object_get_object_member(d, "author");
     const gchar *author_id = json_object_get_string_member(author, "id");
     const gchar *username  = json_object_get_string_member(author, "username");
+
+    /* Cache user_id → username as we see messages */
+    g_hash_table_insert(fd->user_names, g_strdup(author_id), g_strdup(username));
 
     /* Ignore our own messages */
     if (g_strcmp0(author_id, fd->self_user_id) == 0) return;
@@ -722,6 +784,115 @@ handle_message_create(FluxerData *fd, JsonObject *d)
                              PURPLE_MESSAGE_RECV, content, ts);
         }
     }
+}
+
+/* Extract HH:MM:SS from an ISO 8601 string like "2026-03-15T08:23:14.425Z".
+ * Returns a pointer into a static buffer — copy before calling again. */
+static const gchar *
+iso_time(const gchar *iso)
+{
+    static gchar buf[9];
+    if (!iso) return "?";
+    const gchar *t = strchr(iso, 'T');
+    if (!t) return "?";
+    g_strlcpy(buf, t + 1, sizeof(buf));   /* copies up to 8 chars + NUL */
+    return buf;
+}
+
+/* Write a system notice into whichever conversation owns channel_id.
+ * Used for delete/edit notifications. */
+static void
+fluxer_conv_notice(FluxerData *fd, const gchar *channel_id, const gchar *text)
+{
+    time_t ts = time(NULL);
+    gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+
+    if (guild_id == NULL) {
+        /* DM — find conversation by the buddy's name if open */
+        /* We don't have an easy reverse-lookup here; skip for now */
+    } else {
+        gpointer chat_id_ptr = g_hash_table_lookup(fd->chat_id_map, channel_id);
+        if (!chat_id_ptr) return;
+        PurpleConversation *conv =
+            purple_find_chat(fd->gc, GPOINTER_TO_INT(chat_id_ptr));
+        if (conv)
+            purple_conversation_write(conv, NULL, text,
+                                      PURPLE_MESSAGE_SYSTEM, ts);
+    }
+}
+
+static void
+handle_message_delete(FluxerData *fd, JsonObject *d)
+{
+    const gchar *channel_id = json_object_get_string_member(d, "channel_id");
+    const gchar *content    = json_object_has_member(d, "content")
+                            ? json_object_get_string_member(d, "content") : NULL;
+
+    if (!content || *content == '\0') return;
+
+    const gchar *author_id = json_object_has_member(d, "author_id")
+                           ? json_object_get_string_member(d, "author_id") : NULL;
+    const gchar *username  = author_id
+                           ? g_hash_table_lookup(fd->user_names, author_id) : NULL;
+    if (!username) username = author_id ? author_id : "unknown";
+
+    gchar *notice = g_strdup_printf("* %s deleted: %s", username, content);
+    fluxer_conv_notice(fd, channel_id, notice);
+    g_free(notice);
+}
+
+static void
+handle_message_update(FluxerData *fd, JsonObject *d)
+{
+    const gchar *channel_id = json_object_get_string_member(d, "channel_id");
+    const gchar *content    = json_object_has_member(d, "content")
+                            ? json_object_get_string_member(d, "content") : NULL;
+
+    if (!content || *content == '\0') return;
+
+    const gchar *author_id = NULL;
+    const gchar *username  = NULL;
+    if (json_object_has_member(d, "author")) {
+        JsonObject *author = json_object_get_object_member(d, "author");
+        author_id = json_object_get_string_member(author, "id");
+        username  = json_object_get_string_member(author, "username");
+        if (username)
+            g_hash_table_insert(fd->user_names, g_strdup(author_id), g_strdup(username));
+    }
+
+    /* Timestamps: original send time and edit time */
+    const gchar *orig_ts = json_object_has_member(d, "timestamp")
+                         ? json_object_get_string_member(d, "timestamp") : NULL;
+    const gchar *edit_ts = json_object_has_member(d, "edited_timestamp") &&
+                           !json_node_is_null(json_object_get_member(d, "edited_timestamp"))
+                         ? json_object_get_string_member(d, "edited_timestamp") : NULL;
+
+    /* System notice: who edited and when */
+    gchar *orig_str = g_strdup(iso_time(orig_ts));
+    gchar *edit_str = g_strdup(iso_time(edit_ts));
+    gchar *notice   = g_strdup_printf("* %s edited [%s → %s]",
+                                      username ? username : "unknown",
+                                      orig_str, edit_str);
+    fluxer_conv_notice(fd, channel_id, notice);
+    g_free(orig_str);
+    g_free(edit_str);
+    g_free(notice);
+
+    /* Re-post the new content inline */
+    if (!username) return;
+    gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+    gchar *edited   = g_strdup_printf("[edited] %s", content);
+    time_t ts       = time(NULL);
+
+    if (guild_id == NULL) {
+        serv_got_im(fd->gc, username, edited, PURPLE_MESSAGE_RECV, ts);
+    } else {
+        gpointer chat_id_ptr = g_hash_table_lookup(fd->chat_id_map, channel_id);
+        if (chat_id_ptr)
+            serv_got_chat_in(fd->gc, GPOINTER_TO_INT(chat_id_ptr), username,
+                             PURPLE_MESSAGE_RECV, edited, ts);
+    }
+    g_free(edited);
 }
 
 static void
@@ -791,15 +962,108 @@ handle_channel_create(FluxerData *fd, JsonObject *d)
     }
 }
 
+/* Walk the buddy list and check if a chat with this channel_id already exists
+ * for our account.  purple_blist_find_chat() is unreliable during the
+ * connecting phase, so we inspect components directly. */
+static gboolean
+fluxer_chat_exists(PurpleAccount *account, const gchar *channel_id)
+{
+    PurpleBlistNode *gnode, *node;
+    for (gnode = purple_blist_get_root(); gnode; gnode = gnode->next) {
+        if (!PURPLE_BLIST_NODE_IS_GROUP(gnode)) continue;
+        for (node = gnode->child; node; node = node->next) {
+            if (!PURPLE_BLIST_NODE_IS_CHAT(node)) continue;
+            PurpleChat *chat = (PurpleChat *)node;
+            if (purple_chat_get_account(chat) != account) continue;
+            const gchar *stored =
+                g_hash_table_lookup(purple_chat_get_components(chat), "channel_id");
+            if (g_strcmp0(stored, channel_id) == 0)
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* Add a text channel to the Pidgin buddy list under a group named after
+ * the guild.  Skips channels that are already present. */
+static void
+fluxer_blist_seed_channel(FluxerData *fd, const gchar *guild_name,
+                          const gchar *channel_id, const gchar *channel_name)
+{
+    /* Session-level guard: GUILD_CREATE fires after READY for the same guild */
+    if (g_hash_table_contains(fd->seeded_channels, channel_id))
+        return;
+    g_hash_table_insert(fd->seeded_channels, g_strdup(channel_id), GINT_TO_POINTER(1));
+
+    /* Cross-session guard: channel may already exist in saved buddy list */
+    if (fluxer_chat_exists(fd->account, channel_id))
+        return;
+
+    PurpleGroup *group = purple_find_group(guild_name);
+    if (!group) {
+        group = purple_group_new(guild_name);
+        purple_blist_add_group(group, NULL);
+    }
+
+    GHashTable *components =
+        g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+    g_hash_table_insert(components, "channel_id", g_strdup(channel_id));
+
+    PurpleChat *chat = purple_chat_new(fd->account, channel_name, components);
+    purple_blist_add_chat(chat, group, NULL);
+}
+
 static void
 handle_guild_create(FluxerData *fd, JsonObject *d)
 {
     if (!json_object_has_member(d, "channels")) return;
 
     const gchar *guild_id = json_object_get_string_member(d, "id");
-    JsonArray *channels = json_object_get_array_member(d, "channels");
 
-    for (guint i = 0; i < json_array_get_length(channels); i++) {
+    /* Log all top-level keys so we can see exactly what Fluxer sends */
+    {
+        GList *keys = json_object_get_members(d);
+        GString *key_str = g_string_new(NULL);
+        for (GList *l = keys; l; l = l->next)
+            g_string_append_printf(key_str, "%s ", (gchar *)l->data);
+        purple_debug_info("fluxer", "GUILD_CREATE keys: %s\n", key_str->str);
+        g_string_free(key_str, TRUE);
+        g_list_free(keys);
+    }
+
+    /* Guild name: try top-level "name", then "properties"."name" */
+    const gchar *guild_name = NULL;
+    if (json_object_has_member(d, "name"))
+        guild_name = json_object_get_string_member(d, "name");
+    if (!guild_name && json_object_has_member(d, "properties")) {
+        JsonObject *props = json_object_get_object_member(d, "properties");
+        if (props && json_object_has_member(props, "name"))
+            guild_name = json_object_get_string_member(props, "name");
+    }
+    if (!guild_name) guild_name = guild_id;
+
+    g_hash_table_insert(fd->guild_names, g_strdup(guild_id), g_strdup(guild_name));
+
+    JsonArray *channels = json_object_get_array_member(d, "channels");
+    guint n = json_array_get_length(channels);
+
+    /* Pass 1: collect category channels (type=4) → id→name */
+    GHashTable *categories =
+        g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    for (guint i = 0; i < n; i++) {
+        JsonObject *ch = json_array_get_object_element(channels, i);
+        gint ch_type = (gint)json_object_get_int_member(ch, "type");
+        if (ch_type == 4) {
+            const gchar *cat_id   = json_object_get_string_member(ch, "id");
+            const gchar *cat_name = json_object_has_member(ch, "name")
+                                  ? json_object_get_string_member(ch, "name") : NULL;
+            if (cat_id && cat_name)
+                g_hash_table_insert(categories, g_strdup(cat_id), g_strdup(cat_name));
+        }
+    }
+
+    /* Pass 2: seed text/announcement channels under "Guild / Category" groups */
+    for (guint i = 0; i < n; i++) {
         JsonObject *ch = json_array_get_object_element(channels, i);
         const gchar *ch_id   = json_object_get_string_member(ch, "id");
         const gchar *ch_name = json_object_has_member(ch, "name")
@@ -809,15 +1073,138 @@ handle_guild_create(FluxerData *fd, JsonObject *d)
         if (ch_type == 0 || ch_type == 5) {  /* text / announcement */
             g_hash_table_insert(fd->channel_to_guild,
                                 g_strdup(ch_id), g_strdup(guild_id));
-            if (ch_name)
+            if (ch_name) {
                 g_hash_table_insert(fd->channel_names,
                                     g_strdup(ch_id), g_strdup(ch_name));
+
+                /* Build group name: "Guild / Category" or just "Guild" */
+                gchar *group_name;
+                const gchar *parent_id = json_object_has_member(ch, "parent_id") &&
+                    !json_node_is_null(json_object_get_member(ch, "parent_id"))
+                    ? json_object_get_string_member(ch, "parent_id") : NULL;
+                const gchar *cat_name = parent_id
+                    ? g_hash_table_lookup(categories, parent_id) : NULL;
+                if (cat_name)
+                    group_name = g_strdup_printf("%s / %s", guild_name, cat_name);
+                else
+                    group_name = g_strdup(guild_name);
+
+                fluxer_blist_seed_channel(fd, group_name, ch_id, ch_name);
+                g_free(group_name);
+            }
         }
     }
 
+    g_hash_table_destroy(categories);
+
+    /* Collect guild member usernames for chat room population */
+    if (json_object_has_member(d, "members")) {
+        JsonArray *members = json_object_get_array_member(d, "members");
+        guint nm = json_array_get_length(members);
+        GList *member_list = NULL;
+        for (guint i = 0; i < nm; i++) {
+            JsonObject *m    = json_array_get_object_element(members, i);
+            JsonObject *user = json_object_has_member(m, "user")
+                             ? json_object_get_object_member(m, "user") : NULL;
+            if (!user) continue;
+            const gchar *uname = json_object_get_string_member(user, "username");
+            const gchar *uid   = json_object_get_string_member(user, "id");
+            if (uname && uid) {
+                member_list = g_list_prepend(member_list, g_strdup(uname));
+                g_hash_table_insert(fd->user_names, g_strdup(uid), g_strdup(uname));
+            }
+        }
+        g_hash_table_insert(fd->guild_members, g_strdup(guild_id), member_list);
+        purple_debug_info("fluxer",
+            "GUILD_CREATE: guild \"%s\" (%s), %u channels, %u members\n",
+            guild_name, guild_id, n, nm);
+    } else {
+        purple_debug_info("fluxer",
+            "GUILD_CREATE: guild \"%s\" (%s), %u channels\n",
+            guild_name, guild_id, n);
+    }
+
+    /* Request the full member list asynchronously */
+    fluxer_request_guild_members(fd, guild_id);
+}
+
+static void
+fluxer_request_guild_members(FluxerData *fd, const gchar *guild_id)
+{
+    JsonObject *d = json_object_new();
+    json_object_set_string_member(d, "guild_id", guild_id);
+    json_object_set_string_member(d, "query", "");
+    json_object_set_int_member   (d, "limit", 0);
+
+    JsonObject *payload = json_object_new();
+    json_object_set_int_member   (payload, "op", OP_REQUEST_MEMBERS);
+    json_object_set_object_member(payload, "d",  d);
+
+    fluxer_ws_send_json(fd, payload);
+    json_object_unref(payload);
+    purple_debug_info("fluxer", "Sent REQUEST_GUILD_MEMBERS for %s\n", guild_id);
+}
+
+static void
+handle_guild_members_chunk(FluxerData *fd, JsonObject *d)
+{
+    const gchar *guild_id = json_object_get_string_member(d, "guild_id");
+    if (!guild_id || !json_object_has_member(d, "members")) return;
+
+    gint chunk_index = json_object_has_member(d, "chunk_index")
+        ? (gint)json_object_get_int_member(d, "chunk_index") : 0;
+    gint chunk_count = json_object_has_member(d, "chunk_count")
+        ? (gint)json_object_get_int_member(d, "chunk_count") : 1;
+
+    JsonArray *members_arr = json_object_get_array_member(d, "members");
+    guint n = json_array_get_length(members_arr);
+
+    /* Build list of new usernames from this chunk */
+    GList *new_names = NULL;
+    for (guint i = 0; i < n; i++) {
+        JsonObject *m    = json_array_get_object_element(members_arr, i);
+        JsonObject *user = json_object_has_member(m, "user")
+                         ? json_object_get_object_member(m, "user") : NULL;
+        if (!user) continue;
+        const gchar *uname = json_object_get_string_member(user, "username");
+        const gchar *uid   = json_object_get_string_member(user, "id");
+        if (uname && uid) {
+            new_names = g_list_prepend(new_names, g_strdup(uname));
+            g_hash_table_insert(fd->user_names, g_strdup(uid), g_strdup(uname));
+        }
+    }
+
+    /* Add chunk members to any open chat windows for this guild */
+    GHashTableIter iter;
+    gpointer k, v;
+    g_hash_table_iter_init(&iter, fd->chat_id_map);
+    while (g_hash_table_iter_next(&iter, &k, &v)) {
+        const gchar *ch_id   = k;
+        gint         chat_id = GPOINTER_TO_INT(v);
+        const gchar *ch_guild = g_hash_table_lookup(fd->channel_to_guild, ch_id);
+        if (g_strcmp0(ch_guild, guild_id) != 0) continue;
+
+        PurpleConversation *conv = purple_find_chat(fd->gc, chat_id);
+        if (!conv) continue;
+
+        GList *flags = NULL;
+        for (GList *l = new_names; l; l = l->next)
+            flags = g_list_prepend(flags, GINT_TO_POINTER(PURPLE_CBFLAGS_NONE));
+        purple_conv_chat_add_users(PURPLE_CONV_CHAT(conv),
+                                   new_names, NULL, flags, FALSE);
+        g_list_free(flags);
+    }
+
+    /* Merge chunk into guild_members: steal existing list to avoid double-free */
+    GList *existing = g_hash_table_lookup(fd->guild_members, guild_id);
+    if (existing)
+        g_hash_table_steal(fd->guild_members, guild_id);
+    GList *combined = g_list_concat(new_names, existing);
+    g_hash_table_insert(fd->guild_members, g_strdup(guild_id), combined);
+
     purple_debug_info("fluxer",
-        "GUILD_CREATE: guild %s, %u channels\n",
-        guild_id, json_array_get_length(channels));
+        "GUILD_MEMBERS_CHUNK: guild %s chunk %d/%d, %u members\n",
+        guild_id, chunk_index + 1, chunk_count, n);
 }
 
 static void
@@ -836,9 +1223,15 @@ fluxer_handle_dispatch(FluxerData *fd, const gchar *event_name, JsonObject *d)
         handle_presence_update(fd, d);
     else if (g_strcmp0(event_name, "CHANNEL_CREATE")  == 0)
         handle_channel_create(fd, d);
-    else if (g_strcmp0(event_name, "GUILD_CREATE")    == 0)
+    else if (g_strcmp0(event_name, "GUILD_CREATE")         == 0)
         handle_guild_create(fd, d);
-    /* TODO: GUILD_DELETE, CHANNEL_DELETE, USER_UPDATE, MESSAGE_UPDATE, etc. */
+    else if (g_strcmp0(event_name, "GUILD_MEMBERS_CHUNK") == 0)
+        handle_guild_members_chunk(fd, d);
+    else if (g_strcmp0(event_name, "MESSAGE_DELETE")  == 0)
+        handle_message_delete(fd, d);
+    else if (g_strcmp0(event_name, "MESSAGE_UPDATE")  == 0)
+        handle_message_update(fd, d);
+    /* TODO: GUILD_DELETE, CHANNEL_DELETE, USER_UPDATE */
 }
 
 /* ─── WebSocket connection setup ──────────────────────────────────────── */
@@ -954,15 +1347,19 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
     cbd->user_data = user_data;
 
     /* Always build a raw request so Authorization is included on every call */
+    const gchar *scheme_end = url;
     const gchar *host_start = url;
-    if      (g_str_has_prefix(url, "https://")) host_start = url + 8;
-    else if (g_str_has_prefix(url, "http://"))  host_start = url + 7;
+    if      (g_str_has_prefix(url, "https://")) { scheme_end = url + 8; host_start = scheme_end; }
+    else if (g_str_has_prefix(url, "http://"))  { scheme_end = url + 7; host_start = scheme_end; }
 
     const gchar *path_start = strchr(host_start, '/');
     gchar *host = path_start
         ? g_strndup(host_start, path_start - host_start)
         : g_strdup(host_start);
     const gchar *path = path_start ? path_start : "/";
+
+    /* Origin = scheme + host (required by Fluxer's CORS origin check) */
+    gchar *origin = g_strndup(url, (scheme_end - url) + strlen(host));
 
     gsize body_len = body ? strlen(body) : 0;
 
@@ -974,41 +1371,46 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
                 "%s %s HTTP/1.0\r\n"
                 "Connection: close\r\n"
                 "Host: %s\r\n"
+                "Origin: %s\r\n"
                 "User-Agent: %s\r\n"
                 "Content-Type: application/json\r\n"
                 "Authorization: %s\r\n"
                 "Content-Length: %" G_GSIZE_FORMAT "\r\n"
                 "\r\n",
-                method, path, host, FLUXER_USER_AGENT,
+                method, path, host, origin, FLUXER_USER_AGENT,
                 fluxer_auth_header(fd), body_len)
             : g_strdup_printf(
                 "%s %s HTTP/1.0\r\n"
                 "Connection: close\r\n"
                 "Host: %s\r\n"
+                "Origin: %s\r\n"
                 "User-Agent: %s\r\n"
                 "Content-Type: application/json\r\n"
                 "Content-Length: %" G_GSIZE_FORMAT "\r\n"
                 "\r\n",
-                method, path, host, FLUXER_USER_AGENT, body_len);
+                method, path, host, origin, FLUXER_USER_AGENT, body_len);
     } else {
         headers = fd->token
             ? g_strdup_printf(
                 "%s %s HTTP/1.0\r\n"
                 "Connection: close\r\n"
                 "Host: %s\r\n"
+                "Origin: %s\r\n"
                 "User-Agent: %s\r\n"
                 "Authorization: %s\r\n"
                 "\r\n",
-                method, path, host, FLUXER_USER_AGENT,
+                method, path, host, origin, FLUXER_USER_AGENT,
                 fluxer_auth_header(fd))
             : g_strdup_printf(
                 "%s %s HTTP/1.0\r\n"
                 "Connection: close\r\n"
                 "Host: %s\r\n"
+                "Origin: %s\r\n"
                 "User-Agent: %s\r\n"
                 "\r\n",
-                method, path, host, FLUXER_USER_AGENT);
+                method, path, host, origin, FLUXER_USER_AGENT);
     }
+    g_free(origin);
 
     gsize headers_len = strlen(headers);
     gsize request_len = headers_len + body_len;
@@ -1370,6 +1772,197 @@ fluxer_send_typing(PurpleConnection *gc, const gchar *name,
     return 0;
 }
 
+/* ─── Channel history ─────────────────────────────────────────────────── */
+
+static time_t
+parse_timestamp(const gchar *ts)
+{
+    if (!ts) return time(NULL);
+    GDateTime *dt = g_date_time_new_from_iso8601(ts, NULL);
+    if (!dt) return time(NULL);
+    time_t result = (time_t)g_date_time_to_unix(dt);
+    g_date_time_unref(dt);
+    return result;
+}
+
+typedef struct {
+    FluxerData *fd;
+    gchar      *channel_id;
+    gint        chat_id;
+    gboolean    show_separator; /* TRUE for /more fetches; FALSE for initial join load */
+} HistoryFetchData;
+
+static void
+fluxer_got_history_cb(FluxerData *fd, const gchar *body, gpointer user_data)
+{
+    HistoryFetchData *hfd = user_data;
+
+    if (!body) goto done;
+
+    JsonParser *parser = json_parser_new();
+    GError *err = NULL;
+    if (!json_parser_load_from_data(parser, body, -1, &err)) {
+        purple_debug_error("fluxer", "History parse error: %s\n", err->message);
+        g_error_free(err);
+        g_object_unref(parser);
+        goto done;
+    }
+
+    JsonNode *root_node = json_parser_get_root(parser);
+    if (!JSON_NODE_HOLDS_ARRAY(root_node)) {
+        purple_debug_error("fluxer", "History: expected JSON array\n");
+        g_object_unref(parser);
+        goto done;
+    }
+
+    JsonArray *msgs = json_node_get_array(root_node);
+    guint n = json_array_get_length(msgs);
+
+    /* The array is newest-first. Index 0 = newest, index n-1 = oldest. */
+    JsonObject *newest_msg = json_array_get_object_element(msgs, 0);
+    JsonObject *oldest_msg = json_array_get_object_element(msgs, n - 1);
+
+    if (hfd->show_separator) {
+        if (n == 0) {
+            fluxer_conv_notice(fd, hfd->channel_id, "── No older messages ──");
+            g_object_unref(parser);
+            goto done;
+        }
+
+        const gchar *newest_ts_str = json_object_get_string_member(newest_msg, "timestamp");
+        const gchar *oldest_ts_str = json_object_get_string_member(oldest_msg, "timestamp");
+        gchar *header = g_strdup_printf(
+            "── History: %u messages (%s → %s) ──────────",
+            n,
+            oldest_ts_str ? oldest_ts_str : "?",
+            newest_ts_str ? newest_ts_str : "?");
+        fluxer_conv_notice(fd, hfd->channel_id, header);
+        g_free(header);
+    }
+
+    /* Replay oldest-first into the chat window */
+    for (gint i = (gint)n - 1; i >= 0; i--) {
+        JsonObject *msg      = json_array_get_object_element(msgs, i);
+        const gchar *content = json_object_get_string_member(msg, "content");
+        if (!content || *content == '\0') continue;
+
+        JsonObject  *author    = json_object_get_object_member(msg, "author");
+        const gchar *username  = json_object_get_string_member(author, "username");
+        const gchar *author_id = json_object_get_string_member(author, "id");
+        time_t ts = parse_timestamp(
+            json_object_get_string_member(msg, "timestamp"));
+
+        g_hash_table_insert(fd->user_names,
+                            g_strdup(author_id), g_strdup(username));
+
+        serv_got_chat_in(fd->gc, hfd->chat_id, username,
+                         PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_DELAYED,
+                         content, ts);
+    }
+
+    if (hfd->show_separator)
+        fluxer_conv_notice(fd, hfd->channel_id,
+                           "── End of history block — live messages follow ──");
+
+    /* Track the oldest message ID for the next /more page */
+    const gchar *oldest_id = json_object_get_string_member(oldest_msg, "id");
+    if (oldest_id)
+        g_hash_table_insert(fd->oldest_msg_id,
+                            g_strdup(hfd->channel_id), g_strdup(oldest_id));
+
+    purple_debug_info("fluxer", "History: loaded %u messages for %s\n",
+                      n, hfd->channel_id);
+    g_object_unref(parser);
+
+done:
+    g_free(hfd->channel_id);
+    g_free(hfd);
+}
+
+/* ─── Chat (guild channel) ops ────────────────────────────────────────── */
+
+static GList *
+fluxer_chat_info(PurpleConnection *gc)
+{
+    (void)gc;
+    GList *info = NULL;
+    struct proto_chat_entry *pce = g_new0(struct proto_chat_entry, 1);
+    pce->label      = "Channel ID";
+    pce->identifier = "channel_id";
+    pce->required   = TRUE;
+    info = g_list_append(info, pce);
+    return info;
+}
+
+static GHashTable *
+fluxer_chat_info_defaults(PurpleConnection *gc, const char *chat_name)
+{
+    (void)gc;
+    GHashTable *defaults =
+        g_hash_table_new_full(g_str_hash, g_str_equal, NULL, g_free);
+    if (chat_name)
+        g_hash_table_insert(defaults, "channel_id", g_strdup(chat_name));
+    return defaults;
+}
+
+static char *
+fluxer_get_chat_name(GHashTable *components)
+{
+    const gchar *ch_id = g_hash_table_lookup(components, "channel_id");
+    return ch_id ? g_strdup(ch_id) : NULL;
+}
+
+static void
+fluxer_join_chat(PurpleConnection *gc, GHashTable *components)
+{
+    FluxerData *fd = purple_connection_get_protocol_data(gc);
+    const gchar *channel_id = g_hash_table_lookup(components, "channel_id");
+    if (!channel_id) return;
+
+    gpointer existing = g_hash_table_lookup(fd->chat_id_map, channel_id);
+    if (existing) {
+        PurpleConversation *conv =
+            purple_find_chat(gc, GPOINTER_TO_INT(existing));
+        if (conv) purple_conversation_present(conv);
+        return;
+    }
+
+    gint chat_id = fd->next_chat_id++;
+    g_hash_table_insert(fd->chat_id_map,
+                        g_strdup(channel_id), GINT_TO_POINTER(chat_id));
+
+    const gchar *ch_name = g_hash_table_lookup(fd->channel_names, channel_id);
+    serv_got_joined_chat(gc, chat_id, ch_name ? ch_name : channel_id);
+
+    /* Populate the participant list from the guild's member roster */
+    const gchar *guild_id = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+    if (guild_id) {
+        GList *members = g_hash_table_lookup(fd->guild_members, guild_id);
+        if (members) {
+            PurpleConversation *conv = purple_find_chat(gc, chat_id);
+            if (conv) {
+                /* Build a parallel flags list (all NONE) */
+                GList *flags = NULL;
+                for (GList *l = members; l; l = l->next)
+                    flags = g_list_prepend(flags, GINT_TO_POINTER(PURPLE_CBFLAGS_NONE));
+                purple_conv_chat_add_users(PURPLE_CONV_CHAT(conv),
+                                          members, NULL, flags, FALSE);
+                g_list_free(flags);
+            }
+        }
+    }
+
+    /* Fetch recent history */
+    HistoryFetchData *hfd = g_new0(HistoryFetchData, 1);
+    hfd->fd         = fd;
+    hfd->channel_id = g_strdup(channel_id);
+    hfd->chat_id    = chat_id;
+    gchar *url = g_strdup_printf("%s/channels/%s/messages?limit=50",
+                                 fd->api_base, channel_id);
+    fluxer_http_request(fd, "GET", url, NULL, fluxer_got_history_cb, hfd);
+    g_free(url);
+}
+
 /* ─── Status/presence ─────────────────────────────────────────────────── */
 
 static GList *
@@ -1500,8 +2093,8 @@ static PurplePluginProtocolInfo prpl_info = {
     NULL,                           /* tooltip_text */
     fluxer_status_types,            /* status_types */
     NULL,                           /* blist_node_menu */
-    NULL,                           /* chat_info */
-    NULL,                           /* chat_info_defaults */
+    fluxer_chat_info,               /* chat_info */
+    fluxer_chat_info_defaults,      /* chat_info_defaults */
     fluxer_login,                   /* login */
     fluxer_close,                   /* close */
     fluxer_send_im,                 /* send_im */
@@ -1520,9 +2113,9 @@ static PurplePluginProtocolInfo prpl_info = {
     NULL,                           /* rem_permit */
     NULL,                           /* rem_deny */
     NULL,                           /* set_permit_deny */
-    NULL,                           /* join_chat */
+    fluxer_join_chat,               /* join_chat */
     NULL,                           /* reject_chat */
-    NULL,                           /* get_chat_name */
+    fluxer_get_chat_name,           /* get_chat_name */
     NULL,                           /* chat_invite */
     NULL,                           /* chat_leave */
     NULL,                           /* chat_whisper */
@@ -1573,16 +2166,82 @@ fluxer_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
     return "fluxer";
 }
 
+/* ─── /more slash command ─────────────────────────────────────────────── */
+
+static PurpleCmdId fluxer_cmd_more_id = 0;
+
+static PurpleCmdRet
+fluxer_cmd_more(PurpleConversation *conv, const gchar *cmd,
+                gchar **args, gchar **error, void *data)
+{
+    (void)cmd; (void)args; (void)data;
+
+    PurpleConnection *gc = purple_conversation_get_gc(conv);
+    if (!gc) return PURPLE_CMD_RET_FAILED;
+
+    FluxerData *fd = purple_connection_get_protocol_data(gc);
+    if (!fd) return PURPLE_CMD_RET_FAILED;
+
+    /* Resolve chat_id → channel_id */
+    gint chat_id = purple_conv_chat_get_id(PURPLE_CONV_CHAT(conv));
+    gchar *channel_id = NULL;
+    GHashTableIter iter;
+    gpointer k, v;
+    g_hash_table_iter_init(&iter, fd->chat_id_map);
+    while (g_hash_table_iter_next(&iter, &k, &v)) {
+        if (GPOINTER_TO_INT(v) == chat_id) {
+            channel_id = (gchar *)k;
+            break;
+        }
+    }
+
+    if (!channel_id) {
+        *error = g_strdup("Cannot determine channel for this conversation.");
+        return PURPLE_CMD_RET_FAILED;
+    }
+
+    const gchar *before_id = g_hash_table_lookup(fd->oldest_msg_id, channel_id);
+    if (!before_id) {
+        *error = g_strdup("No history cursor — open the channel first.");
+        return PURPLE_CMD_RET_FAILED;
+    }
+
+    HistoryFetchData *hfd = g_new0(HistoryFetchData, 1);
+    hfd->fd             = fd;
+    hfd->channel_id     = g_strdup(channel_id);
+    hfd->chat_id        = chat_id;
+    hfd->show_separator = TRUE;
+
+    gchar *url = g_strdup_printf("%s/channels/%s/messages?limit=50&before=%s",
+                                 fd->api_base, channel_id, before_id);
+    fluxer_http_request(fd, "GET", url, NULL, fluxer_got_history_cb, hfd);
+    g_free(url);
+
+    return PURPLE_CMD_RET_OK;
+}
+
 static gboolean
 fluxer_plugin_load(PurplePlugin *plugin)
 {
     prpl_info.protocol_options = fluxer_account_options();
+
+    fluxer_cmd_more_id = purple_cmd_register(
+        "more", "", PURPLE_CMD_P_PLUGIN,
+        PURPLE_CMD_FLAG_CHAT, FLUXER_PLUGIN_ID,
+        fluxer_cmd_more,
+        "more: Load older message history for this channel",
+        NULL);
+
     return TRUE;
 }
 
 static gboolean
 fluxer_plugin_unload(PurplePlugin *plugin)
 {
+    if (fluxer_cmd_more_id != 0) {
+        purple_cmd_unregister(fluxer_cmd_more_id);
+        fluxer_cmd_more_id = 0;
+    }
     return TRUE;
 }
 
