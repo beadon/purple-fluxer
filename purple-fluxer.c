@@ -679,6 +679,13 @@ handle_ready(FluxerData *fd, JsonObject *d)
     fd->self_user_id  = g_strdup(id);
     fd->self_username = g_strdup(uname);
 
+    /* purple_conv_im_write(im, NULL, …) calls purple_account_get_name_for_display
+     * which checks connection display name before falling back to the login email.
+     * Setting it here makes DM auto-echoes show "beadon" not the email address.
+     * Guild chat sender display is unaffected (OPT_PROTO_UNIQUE_CHATNAME takes
+     * precedence for chats). */
+    purple_connection_set_display_name(fd->gc, uname);
+
     g_free(fd->session_id);
     fd->session_id = g_strdup(
         json_object_get_string_member(d, "session_id"));
@@ -2074,7 +2081,10 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
                             fluxer_sent_message_cb, NULL);
         g_free(url);
         g_free(body_str);
-        return 1;
+        /* Return 0: suppress libpurple's IM auto-echo (which would show raw
+         * markdown and the email sender name). The gateway MESSAGE_CREATE echo
+         * with channel_type=999 delivers the formatted message via serv_got_im. */
+        return 0;
     }
 
     /* Resolve username → user_id via reverse scan of user_names map */
