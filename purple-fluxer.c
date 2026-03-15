@@ -765,6 +765,178 @@ handle_ready(FluxerData *fd, JsonObject *d)
  *
  * Returns a newly-allocated string; caller must g_free().
  */
+/* Convert Discord markdown in an already-HTML-escaped string to HTML tags
+ * for Pidgin's GtkIMHtml renderer.  Processes left-to-right in a single pass
+ * so code spans protect their contents from inner markdown expansion.
+ *
+ * Handled:
+ *   ```…```         code block  → <font face="monospace">
+ *   `…`             inline code → <font face="monospace">
+ *   ***…***         bold+italic → <b><i>
+ *   **…**           bold        → <b>
+ *   *…*             italic      → <i>
+ *   __…__           underline   → <u>
+ *   ~~…~~           strikethrough → <s>
+ *   ||…||           spoiler     → greyed [spoiler: …]
+ *   \n              newline     → <br>
+ *
+ * Note: _italic_ is intentionally skipped — too many false positives with
+ * snake_case identifiers common on technical servers.
+ *
+ * Input must be HTML-escaped (& < > already converted to entities).
+ * Returns a newly-allocated string; caller must g_free().
+ */
+static gchar *
+fluxer_markdown_to_html(const gchar *esc)
+{
+    GString *out = g_string_sized_new(strlen(esc) + 64);
+    const gchar *p = esc;
+
+    while (*p) {
+
+        /* ── Code block: ```[lang]\n content ``` ── */
+        if (p[0]=='`' && p[1]=='`' && p[2]=='`') {
+            p += 3;
+            while (*p && *p != '\n') p++;   /* skip optional lang tag */
+            if (*p == '\n') p++;
+            const gchar *end = strstr(p, "```");
+            if (end) {
+                g_string_append(out, "<font face=\"monospace\">");
+                for (const gchar *q = p; q < end; q++) {
+                    if (*q == '\n') g_string_append(out, "<br>");
+                    else            g_string_append_c(out, *q);
+                }
+                g_string_append(out, "</font>");
+                p = end + 3;
+            } else {
+                g_string_append(out, "```");
+            }
+            continue;
+        }
+
+        /* ── Inline code: `…` ── */
+        if (p[0] == '`') {
+            const gchar *end = strchr(p + 1, '`');
+            if (end) {
+                g_string_append(out, "<font face=\"monospace\">");
+                g_string_append_len(out, p + 1, end - (p + 1));
+                g_string_append(out, "</font>");
+                p = end + 1;
+            } else {
+                g_string_append_c(out, *p++);
+            }
+            continue;
+        }
+
+        /* ── Bold + italic: ***…*** ── */
+        if (p[0]=='*' && p[1]=='*' && p[2]=='*') {
+            const gchar *end = strstr(p + 3, "***");
+            if (end) {
+                g_string_append(out, "<b><i>");
+                g_string_append_len(out, p + 3, end - (p + 3));
+                g_string_append(out, "</i></b>");
+                p = end + 3;
+                continue;
+            }
+        }
+
+        /* ── Bold: **…** ── */
+        if (p[0]=='*' && p[1]=='*') {
+            const gchar *end = strstr(p + 2, "**");
+            if (end) {
+                g_string_append(out, "<b>");
+                g_string_append_len(out, p + 2, end - (p + 2));
+                g_string_append(out, "</b>");
+                p = end + 2;
+                continue;
+            }
+        }
+
+        /* ── Italic: *…* (single star) ── */
+        if (p[0]=='*' && p[1]!='*') {
+            const gchar *end = strchr(p + 1, '*');
+            if (end && end[1] != '*') {
+                g_string_append(out, "<i>");
+                g_string_append_len(out, p + 1, end - (p + 1));
+                g_string_append(out, "</i>");
+                p = end + 1;
+                continue;
+            }
+        }
+
+        /* ── Underline: __…__ ── */
+        if (p[0]=='_' && p[1]=='_') {
+            const gchar *end = strstr(p + 2, "__");
+            if (end) {
+                g_string_append(out, "<u>");
+                g_string_append_len(out, p + 2, end - (p + 2));
+                g_string_append(out, "</u>");
+                p = end + 2;
+                continue;
+            }
+        }
+
+        /* ── Strikethrough: ~~…~~ ── */
+        if (p[0]=='~' && p[1]=='~') {
+            const gchar *end = strstr(p + 2, "~~");
+            if (end) {
+                g_string_append(out, "<s>");
+                g_string_append_len(out, p + 2, end - (p + 2));
+                g_string_append(out, "</s>");
+                p = end + 2;
+                continue;
+            }
+        }
+
+        /* ── Spoiler: ||…|| ── */
+        if (p[0]=='|' && p[1]=='|') {
+            const gchar *end = strstr(p + 2, "||");
+            if (end) {
+                g_string_append(out, "<font color=\"#808080\">[spoiler: ");
+                g_string_append_len(out, p + 2, end - (p + 2));
+                g_string_append(out, "]</font>");
+                p = end + 2;
+                continue;
+            }
+        }
+
+        /* ── Newline → <br> ── */
+        if (*p == '\n') {
+            g_string_append(out, "<br>");
+            p++;
+            continue;
+        }
+
+        g_string_append_c(out, *p++);
+    }
+
+    return g_string_free(out, FALSE);
+}
+
+/* Full incoming-message pipeline:
+ *   raw server text
+ *   → resolve mention tokens (<@id>, <#id>, etc.) to display names
+ *   → HTML-escape (& < > " → entities) so the text is safe to embed in HTML
+ *   → convert Discord markdown to HTML tags
+ *
+ * Sets *out_nick if the message should trigger PURPLE_MESSAGE_NICK.
+ * Returns a newly-allocated HTML string; caller must g_free().
+ */
+/* Forward declaration — fluxer_resolve_mentions is defined below. */
+static gchar *fluxer_resolve_mentions(FluxerData *fd, const gchar *content,
+                                      gboolean *out_nick);
+
+static gchar *
+fluxer_format_content(FluxerData *fd, const gchar *content, gboolean *out_nick)
+{
+    gchar *resolved = fluxer_resolve_mentions(fd, content, out_nick);
+    gchar *escaped  = g_markup_escape_text(resolved, -1);
+    g_free(resolved);
+    gchar *html     = fluxer_markdown_to_html(escaped);
+    g_free(escaped);
+    return html;
+}
+
 static gchar *
 fluxer_resolve_mentions(FluxerData *fd, const gchar *content, gboolean *out_nick)
 {
@@ -880,7 +1052,7 @@ handle_message_create(FluxerData *fd, JsonObject *d)
 
     /* Resolve inline mentions; detect if we were mentioned. */
     gboolean is_nick = FALSE;
-    gchar *resolved = fluxer_resolve_mentions(fd, content, &is_nick);
+    gchar *resolved = fluxer_format_content(fd, content, &is_nick);
 
     /* Personal notes (type 999): authored by self, deliver as IM */
     if (ch_type == 999) {
@@ -1738,6 +1910,9 @@ fluxer_login(PurpleAccount *account)
         purple_account_get_string(account, "api_base", FLUXER_API_BASE);
     fd->api_base = g_strdup((api_base_setting && *api_base_setting)
                             ? api_base_setting : FLUXER_API_BASE);
+
+    /* Tell libpurple/Pidgin we send and receive HTML so formatting is rendered. */
+    gc->flags |= PURPLE_CONNECTION_HTML;
 
     purple_connection_update_progress(gc, "Connecting", 0, 3);
 
