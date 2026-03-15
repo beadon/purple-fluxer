@@ -1385,8 +1385,36 @@ handle_typing_start(FluxerData *fd, JsonObject *d)
 {
     const gchar *channel_id = json_object_get_string_member(d, "channel_id");
     const gchar *user_id    = json_object_get_string_member(d, "user_id");
-    (void)channel_id; (void)user_id;
-    /* TODO: call purple_serv_got_typing() once we resolve user_id→username */
+    if (!channel_id || !user_id) return;
+
+    /* Don't show our own typing indicator back to ourselves */
+    if (g_strcmp0(user_id, fd->self_user_id) == 0) {
+        purple_debug_info("fluxer", "TYPING_START: ignored (self) ch=%s\n",
+                          channel_id);
+        return;
+    }
+
+    const gchar *username = g_hash_table_lookup(fd->user_names, user_id);
+    if (!username) {
+        purple_debug_warning("fluxer",
+            "TYPING_START: unknown user_id=%s ch=%s\n", user_id, channel_id);
+        return;
+    }
+
+    /* libpurple 2.x only supports typing indicators for IMs, not chat rooms.
+     * Skip guild channel typing events (channel_to_guild value is non-NULL). */
+    gpointer guild = g_hash_table_lookup(fd->channel_to_guild, channel_id);
+    if (guild) {
+        purple_debug_info("fluxer",
+            "TYPING_START: ignored (guild ch=%s) user=%s\n",
+            channel_id, username);
+        return;
+    }
+
+    purple_debug_info("fluxer", "TYPING_START: %s in DM ch=%s\n",
+                      username, channel_id);
+    /* 10-second timeout matches Discord's server-side typing expiry */
+    serv_got_typing(fd->gc, username, 10, PURPLE_TYPING);
 }
 
 static void
@@ -2254,6 +2282,25 @@ fluxer_close(PurpleConnection *gc)
     purple_connection_set_protocol_data(gc, NULL);
 }
 
+/* ─── Shared lookup helpers ───────────────────────────────────────────── */
+
+/* Reverse-scan user_names (user_id → username) to find the user_id for a
+ * given username.  Falls back to PurpleBuddy protocol data.
+ * Returns a pointer into fd->user_names (not owned) or NULL. */
+static const gchar *
+fluxer_uid_for_buddy(FluxerData *fd, const gchar *who)
+{
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, fd->user_names);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        if (g_strcmp0((const gchar *)v, who) == 0)
+            return (const gchar *)k;
+    }
+    PurpleBuddy *buddy = purple_find_buddy(fd->account, who);
+    return buddy ? purple_buddy_get_protocol_data(buddy) : NULL;
+}
+
 /* ─── Messaging ───────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -2362,26 +2409,7 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         return 0;
     }
 
-    /* Resolve username → user_id via reverse scan of user_names map */
-    const gchar *uid = NULL;
-    {
-        GHashTableIter it;
-        gpointer k, v;
-        g_hash_table_iter_init(&it, fd->user_names);
-        while (g_hash_table_iter_next(&it, &k, &v)) {
-            if (g_strcmp0((const gchar *)v, who) == 0) {
-                uid = (const gchar *)k;
-                break;
-            }
-        }
-    }
-
-    /* Fall back to buddy protocol data (set for DM buddies from READY) */
-    if (!uid) {
-        PurpleBuddy *buddy = purple_find_buddy(fd->account, who);
-        uid = buddy ? purple_buddy_get_protocol_data(buddy) : NULL;
-    }
-
+    const gchar *uid = fluxer_uid_for_buddy(fd, who);
     if (!uid) {
         purple_debug_warning("fluxer",
             "Cannot send to %s: user_id unknown\n", who);
@@ -2468,9 +2496,25 @@ static unsigned int
 fluxer_send_typing(PurpleConnection *gc, const gchar *name,
                    PurpleTypingState state)
 {
-    /* TODO: find channel_id, POST /channels/{id}/typing */
-    (void)gc; (void)name; (void)state;
-    return 0;
+    /* Discord has no "stop typing" endpoint — typing simply expires after
+     * ~10 seconds server-side.  Only POST when the user is actively typing. */
+    if (state != PURPLE_TYPING) return 0;
+
+    FluxerData *fd = purple_connection_get_protocol_data(gc);
+
+    const gchar *uid = fluxer_uid_for_buddy(fd, name);
+    if (!uid) return 0;
+
+    const gchar *ch_id = g_hash_table_lookup(fd->dm_channels, uid);
+    if (!ch_id) return 0;   /* DM channel not yet open */
+
+    gchar *url = g_strdup_printf("%s/channels/%s/typing", fd->api_base, ch_id);
+    /* POST with empty body — Content-Length: 0 via passing "" */
+    fluxer_http_request(fd, "POST", url, "", fluxer_sent_message_cb, NULL);
+    g_free(url);
+
+    /* Return 10 so libpurple re-invokes every 10 s while typing continues */
+    return 10;
 }
 
 /* ─── Channel history ─────────────────────────────────────────────────── */

@@ -41,8 +41,8 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Message reply context | ❌ (TODO) |
 | File attachments (links + inline images) | ❌ (TODO) |
 | Buddy avatars | ❌ (TODO) |
-| Typing indicator send | ❌ (stub — needs channel lookup) |
-| Typing indicator receive | ❌ (stub — needs user_id→name index) |
+| Typing indicator send | ✅ (DMs only — no guild chat typing API in libpurple 2.x) |
+| Typing indicator receive | ✅ (DMs only — same limitation) |
 | `GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE` live updates | ❌ (TODO) |
 | Reactions display | ❌ (TODO) |
 | MFA / TOTP login | ❌ (TODO) |
@@ -171,7 +171,13 @@ contribution targets:
    public API to bold a closed chat entry without opening a window. Full
    support requires a new "unseen chat" signal or node-data hook in
    libpurple's `gtkblist.c`.
-6. **Per-guild display names (server nicknames)** — Discord-compatible platforms
+6. **Typing indicators in guild chat rooms** — `serv_got_typing` and
+   `send_typing` are IM-only APIs; there is no equivalent for `PurpleConvChat`.
+   Typing notifications in guild channels are silently dropped. The proposed
+   API would be `serv_got_chat_typing(gc, chat_id, username, state)` mirroring
+   `serv_got_chat_in`, and a corresponding `chat_send_typing` prpl op alongside
+   the existing `send_typing`.
+7. **Per-guild display names (server nicknames)** — Discord-compatible platforms
    support a per-server nickname distinct from the global username. libpurple
    buddies have a single global alias; `get_cb_alias` has no room/guild context
    parameter, so per-guild overrides cannot be implemented at the plugin level.
