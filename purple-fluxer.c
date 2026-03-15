@@ -753,6 +753,113 @@ handle_ready(FluxerData *fd, JsonObject *d)
     purple_connection_update_progress(fd->gc, "Connected", 3, 3);
 }
 
+/* Resolve Discord-style inline mentions in a message body.
+ *
+ * Replaces:
+ *   <@user_id>   / <@!user_id>  →  @username   (user mention)
+ *   <#channel_id>               →  #channel    (channel mention)
+ *   <@&role_id>                 →  @role-id    (role — names not cached yet)
+ *
+ * Sets *out_nick = TRUE if the resolved text contains our own username,
+ * @everyone, or @here (signals PURPLE_MESSAGE_NICK to Pidgin).
+ *
+ * Returns a newly-allocated string; caller must g_free().
+ */
+static gchar *
+fluxer_resolve_mentions(FluxerData *fd, const gchar *content, gboolean *out_nick)
+{
+    *out_nick = FALSE;
+
+    /* Quick check: if no '<' and no '@everyone'/'@here', nothing to do. */
+    gboolean has_bracket  = (strchr(content, '<') != NULL);
+    gboolean has_everyone = (strstr(content, "@everyone") != NULL);
+    gboolean has_here     = (strstr(content, "@here") != NULL);
+
+    if (has_everyone || has_here)
+        *out_nick = TRUE;
+
+    if (!has_bracket) {
+        /* No inline mentions — still need a copy for the caller to g_free(). */
+        return g_strdup(content);
+    }
+
+    GString *out = g_string_sized_new(strlen(content) + 32);
+    const gchar *p = content;
+
+    while (*p) {
+        if (*p != '<') {
+            g_string_append_c(out, *p++);
+            continue;
+        }
+
+        /* Try to match a mention token: <@…>, <@!…>, <@&…>, <#…> */
+        const gchar *start = p;   /* points at '<' */
+        p++;                      /* skip '<' */
+
+        gchar  kind   = '\0';     /* '@' or '#' */
+        gboolean role = FALSE;
+        gboolean nick_pfx = FALSE;
+
+        if (*p == '@') {
+            kind = '@';
+            p++;
+            if (*p == '&') { role = TRUE;     p++; }
+            else if (*p == '!') { nick_pfx = TRUE; p++; }
+            (void)nick_pfx;   /* handled same as plain user mention */
+        } else if (*p == '#') {
+            kind = '#';
+            p++;
+        } else {
+            /* Not a mention — emit '<' and rewind to the char after it. */
+            g_string_append_c(out, '<');
+            p = start + 1;
+            continue;
+        }
+
+        /* Collect digits of the snowflake ID. */
+        const gchar *id_start = p;
+        while (*p >= '0' && *p <= '9') p++;
+
+        if (*p != '>' || p == id_start) {
+            /* Malformed — emit verbatim from start up to current pos. */
+            g_string_append_len(out, start, (gssize)(p - start));
+            continue;
+        }
+
+        /* We have a valid mention: id_start..p is the snowflake, *p == '>' */
+        gchar *id = g_strndup(id_start, (gsize)(p - id_start));
+        p++;   /* skip '>' */
+
+        if (kind == '@' && !role) {
+            const gchar *uname = g_hash_table_lookup(fd->user_names, id);
+            if (uname) {
+                g_string_append_c(out, '@');
+                g_string_append(out, uname);
+                if (g_strcmp0(uname, fd->self_username) == 0)
+                    *out_nick = TRUE;
+            } else {
+                /* Unknown user — keep the raw token so nothing is lost. */
+                g_string_append_printf(out, "<@%s>", id);
+            }
+        } else if (kind == '@' && role) {
+            /* We don't cache role names yet; show a readable placeholder. */
+            g_string_append_printf(out, "@role:%s", id);
+        } else {   /* kind == '#' */
+            const gchar *cname = g_hash_table_lookup(fd->channel_names, id);
+            if (cname) {
+                g_string_append_c(out, '#');
+                g_string_append(out, cname);
+            } else {
+                g_string_append_printf(out, "<#%s>", id);
+            }
+        }
+
+        g_free(id);
+    }
+
+    return g_string_free(out, FALSE);
+}
+
 static void
 handle_message_create(FluxerData *fd, JsonObject *d)
 {
@@ -771,10 +878,15 @@ handle_message_create(FluxerData *fd, JsonObject *d)
     gint ch_type = json_object_has_member(d, "channel_type")
         ? (gint)json_object_get_int_member(d, "channel_type") : -1;
 
+    /* Resolve inline mentions; detect if we were mentioned. */
+    gboolean is_nick = FALSE;
+    gchar *resolved = fluxer_resolve_mentions(fd, content, &is_nick);
+
     /* Personal notes (type 999): authored by self, deliver as IM */
     if (ch_type == 999) {
-        serv_got_im(fd->gc, fd->self_username, content,
+        serv_got_im(fd->gc, fd->self_username, resolved,
                     PURPLE_MESSAGE_RECV, time(NULL));
+        g_free(resolved);
         return;
     }
 
@@ -784,8 +896,8 @@ handle_message_create(FluxerData *fd, JsonObject *d)
 
     if (guild_id == NULL) {
         /* DM — libpurple echoes outgoing IMs automatically, drop self */
-        if (is_self) return;
-        serv_got_im(fd->gc, username, content, PURPLE_MESSAGE_RECV, ts);
+        if (is_self) { g_free(resolved); return; }
+        serv_got_im(fd->gc, username, resolved, PURPLE_MESSAGE_RECV, ts);
     } else {
         /* Guild channel — gateway echo is the display path for all messages,
          * including our own (libpurple does not auto-echo for chats).
@@ -798,9 +910,13 @@ handle_message_create(FluxerData *fd, JsonObject *d)
             gint chat_id = GPOINTER_TO_INT(chat_id_ptr);
             PurpleMessageFlags mflags =
                 is_self ? PURPLE_MESSAGE_SEND : PURPLE_MESSAGE_RECV;
-            serv_got_chat_in(fd->gc, chat_id, username, mflags, content, ts);
+            if (is_nick && !is_self)
+                mflags |= PURPLE_MESSAGE_NICK;
+            serv_got_chat_in(fd->gc, chat_id, username, mflags, resolved, ts);
         }
     }
+
+    g_free(resolved);
 }
 
 /* Extract HH:MM:SS from an ISO 8601 string like "2026-03-15T08:23:14.425Z".
