@@ -34,7 +34,7 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Open DM from guild member list | ✅ |
 | Personal notes channel (type 999) | ✅ |
 | Correct sender name in guild chat | ✅ (`OPT_PROTO_UNIQUE_CHATNAME`) |
-| Markdown rendering (bold/italic/code/strikethrough) | ❌ (TODO) |
+| Markdown rendering (bold/italic/code/strikethrough/underline/spoiler) | ✅ (incoming + outgoing round-trip) |
 | Mention resolution (`<@id>` → username, `<#id>` → channel) | ❌ (TODO) |
 | `@mention` tab highlight (`PURPLE_MESSAGE_NICK`) | ❌ (TODO — implement alongside mention resolution) |
 | Unread indicator on buddy list for closed channels | ❌ (TODO — use `read_states` from READY payload) |
