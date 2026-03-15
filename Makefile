@@ -18,11 +18,10 @@ SYSTEM_PLUGINDIR = $(shell pkg-config --variable=plugindir purple)
 USER_PLUGINDIR   = $(HOME)/.purple/plugins
 
 # Pidgin 2.x hardcodes protocol icons to the system DATADIR — no user override path exists.
-# 'make install-icons' installs placeholder icons system-wide (requires sudo).
-ICON_SIZES       = 16 22 48
-ICON_DIR         = /usr/share/pixmaps/pidgin/protocols
+# 'make install-icons' installs the official Fluxer icons system-wide (requires sudo).
+ICON_DIR = /usr/share/pixmaps/pidgin/protocols
 
-.PHONY: all clean install install-user install-icons icons/fluxer.png
+.PHONY: all clean install install-user install-icons
 
 all: $(PLUGIN_SO)
 
@@ -41,21 +40,10 @@ install-user: $(PLUGIN_SO)
 	install -m 644 $(PLUGIN_SO) $(USER_PLUGINDIR)
 
 # Pidgin 2.x has no user-local icon path — system install is unavoidable.
-# Generate a minimal placeholder PNG at each required size and install it.
-install-icons: icons/fluxer.png
-	$(foreach sz,$(ICON_SIZES), \
-	  sudo install -Dm644 icons/fluxer.png $(ICON_DIR)/$(sz)/fluxer.png ;)
-
-icons/fluxer.png:
-	mkdir -p icons
-	python3 -c "\
-import struct, zlib; \
-def png(w,h,rgb): \
-  r,g,b=rgb; raw=b''.join(b'\x00'+bytes([r,g,b]*w) for _ in range(h)); \
-  idat=zlib.compress(raw); \
-  def chunk(t,d): c=zlib.crc32(t+d)&0xffffffff; return struct.pack('>I',len(d))+t+d+struct.pack('>I',c); \
-  return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+chunk(b'IDAT',idat)+chunk(b'IEND',b''); \
-open('icons/fluxer.png','wb').write(png(48,48,(0x5c,0x6b,0xff)))"
+install-icons:
+	sudo install -Dm644 icons/fluxer16.png $(ICON_DIR)/16/fluxer.png
+	sudo install -Dm644 icons/fluxer22.png $(ICON_DIR)/22/fluxer.png
+	sudo install -Dm644 icons/fluxer48.png $(ICON_DIR)/48/fluxer.png
 
 clean:
 	rm -f $(OBJS) $(PLUGIN_SO)
