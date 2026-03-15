@@ -25,6 +25,7 @@
 
 /* libpurple */
 #include <account.h>
+#include <accountopt.h>
 #include <connection.h>
 #include <conversation.h>
 #include <debug.h>
@@ -143,6 +144,7 @@ static void fluxer_ws_send_json(FluxerData *fd, JsonObject *obj);
 static void fluxer_gateway_send_identify(FluxerData *fd);
 static void fluxer_gateway_send_heartbeat(FluxerData *fd);
 static void fluxer_handle_dispatch(FluxerData *fd, const gchar *event_name, JsonObject *d);
+static const gchar *fluxer_list_icon(PurpleAccount *account, PurpleBuddy *buddy);
 
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -176,7 +178,7 @@ fluxer_data_free(FluxerData *fd)
 
     /* Cancel any pending HTTP */
     g_slist_foreach(fd->pending_http,
-                    (GFunc)purple_http_conn_cancel, NULL);
+                    (GFunc)purple_util_fetch_url_cancel, NULL);
     g_slist_free(fd->pending_http);
 
     g_string_free(fd->ws_recv_buf, TRUE);
@@ -704,16 +706,16 @@ handle_message_create(FluxerData *fd, JsonObject *d)
 
     if (guild_id == NULL) {
         /* DM — deliver as IM */
-        purple_serv_got_im(fd->gc, username, content,
-                           PURPLE_MESSAGE_RECV, ts);
+        serv_got_im(fd->gc, username, content,
+                    PURPLE_MESSAGE_RECV, ts);
     } else {
         /* Guild channel — deliver to chat */
         gpointer chat_id_ptr =
             g_hash_table_lookup(fd->chat_id_map, channel_id);
         if (chat_id_ptr) {
             gint chat_id = GPOINTER_TO_INT(chat_id_ptr);
-            purple_serv_got_chat_in(fd->gc, chat_id, username,
-                                    PURPLE_MESSAGE_RECV, content, ts);
+            serv_got_chat_in(fd->gc, chat_id, username,
+                             PURPLE_MESSAGE_RECV, content, ts);
         }
     }
 }
@@ -911,23 +913,26 @@ typedef struct {
 } HttpCallbackData;
 
 static void
-fluxer_http_cb(PurpleHttpConnection *conn, PurpleHttpResponse *response,
-               gpointer data)
+fluxer_http_cb(PurpleUtilFetchUrlData *url_data, gpointer user_data,
+               const gchar *webdata, gsize len, const gchar *error_message)
 {
-    HttpCallbackData *cbd = data;
+    purple_debug_info("fluxer", "HTTP callback fired (len=%" G_GSIZE_FORMAT
+                      " error=%s)\n", len,
+                      error_message ? error_message : "(none)");
+
+    HttpCallbackData *cbd = user_data;
     FluxerData *fd = cbd->fd;
 
-    fd->pending_http = g_slist_remove(fd->pending_http, conn);
+    fd->pending_http = g_slist_remove(fd->pending_http, url_data);
 
-    if (purple_http_response_is_successful(response)) {
-        const gchar *body = purple_http_response_get_data(response, NULL);
-        if (cbd->callback)
-            cbd->callback(fd, body, cbd->user_data);
+    if (error_message) {
+        purple_debug_error("fluxer", "HTTP error: %s\n", error_message);
+    } else if (cbd->callback && webdata) {
+        purple_debug_info("fluxer", "HTTP response body (first 200): %.200s\n",
+                          webdata);
+        cbd->callback(fd, webdata, cbd->user_data);
     } else {
-        purple_debug_error("fluxer",
-            "HTTP error %d: %s\n",
-            purple_http_response_get_code(response),
-            purple_http_response_get_data(response, NULL));
+        purple_debug_warning("fluxer", "HTTP callback: no body and no error\n");
     }
 
     g_free(cbd);
@@ -939,29 +944,80 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
                     void (*callback)(FluxerData *, const gchar *, gpointer),
                     gpointer user_data)
 {
-    PurpleHttpRequest *req = purple_http_request_new(url);
-    purple_http_request_set_method(req, method);
-    purple_http_request_header_set(req, "User-Agent", FLUXER_USER_AGENT);
-    purple_http_request_header_set(req, "Content-Type", "application/json");
-
-    if (fd->token)
-        purple_http_request_header_set(req, "Authorization",
-                                       fluxer_auth_header(fd));
-
-    if (body)
-        purple_http_request_set_contents(req, body, strlen(body));
-
     HttpCallbackData *cbd = g_new0(HttpCallbackData, 1);
     cbd->fd        = fd;
     cbd->callback  = callback;
     cbd->user_data = user_data;
 
-    PurpleHttpConnection *conn =
-        purple_http_request(fd->gc, req, fluxer_http_cb, cbd);
-    purple_http_request_unref(req);
+    gchar *request = NULL;
+    gsize  request_len = 0;
 
-    if (conn)
-        fd->pending_http = g_slist_prepend(fd->pending_http, conn);
+    /* For non-GET or requests with a body, build a raw HTTP request string */
+    if (body || g_strcmp0(method, "GET") != 0) {
+        /* Extract host and path from URL */
+        const gchar *host_start = url;
+        if      (g_str_has_prefix(url, "https://")) host_start = url + 8;
+        else if (g_str_has_prefix(url, "http://"))  host_start = url + 7;
+
+        const gchar *path_start = strchr(host_start, '/');
+        gchar *host = path_start
+            ? g_strndup(host_start, path_start - host_start)
+            : g_strdup(host_start);
+        const gchar *path = path_start ? path_start : "/";
+
+        gsize body_len = body ? strlen(body) : 0;
+
+        gchar *headers = fd->token
+            ? g_strdup_printf(
+                "%s %s HTTP/1.0\r\n"
+                "Connection: close\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Authorization: %s\r\n"
+                "Content-Length: %" G_GSIZE_FORMAT "\r\n"
+                "\r\n",
+                method, path, host, FLUXER_USER_AGENT,
+                fluxer_auth_header(fd), body_len)
+            : g_strdup_printf(
+                "%s %s HTTP/1.0\r\n"
+                "Connection: close\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %" G_GSIZE_FORMAT "\r\n"
+                "\r\n",
+                method, path, host, FLUXER_USER_AGENT, body_len);
+
+        gsize headers_len = strlen(headers);
+        request_len = headers_len + body_len;
+        request = g_malloc(request_len + 1);
+        memcpy(request, headers, headers_len);
+        if (body) memcpy(request + headers_len, body, body_len);
+        request[request_len] = '\0';
+
+        g_free(headers);
+        g_free(host);
+    }
+
+    purple_debug_info("fluxer", "HTTP %s %s (body_len=%" G_GSIZE_FORMAT ")\n",
+                      method, url, request_len);
+
+    PurpleUtilFetchUrlData *fetch_data =
+        purple_util_fetch_url_request_data_len_with_account(
+            fd->account, url, TRUE, FLUXER_USER_AGENT, FALSE,
+            request, request_len, FALSE, -1,
+            fluxer_http_cb, cbd);
+
+    g_free(request);
+
+    if (fetch_data) {
+        purple_debug_info("fluxer", "HTTP fetch started OK\n");
+        fd->pending_http = g_slist_prepend(fd->pending_http, fetch_data);
+    } else {
+        purple_debug_error("fluxer", "HTTP fetch failed to start (returned NULL)\n");
+        g_free(cbd);
+    }
 }
 
 /* ─── Login flow ──────────────────────────────────────────────────────── */
@@ -1017,8 +1073,10 @@ static void
 fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
 {
     (void)user_data;
+    purple_debug_info("fluxer", "Got login response\n");
     JsonObject *root = string_to_json_object(body);
     if (!root) {
+        purple_debug_error("fluxer", "Login response JSON parse failed\n");
         purple_connection_error_reason(fd->gc,
             PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
             "Failed to parse login response");
@@ -1029,6 +1087,7 @@ fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
         const gchar *msg = json_object_has_member(root, "message")
             ? json_object_get_string_member(root, "message")
             : "Login failed — check email and password";
+        purple_debug_error("fluxer", "Login failed: %s\n", msg);
         purple_connection_error_reason(fd->gc,
             PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED, msg);
         json_object_unref(root);
@@ -1263,11 +1322,13 @@ fluxer_send_chat(PurpleConnection *gc, int id,
     return 1;
 }
 
-static void
-fluxer_send_typing(PurpleConnection *gc, const gchar *name)
+static unsigned int
+fluxer_send_typing(PurpleConnection *gc, const gchar *name,
+                   PurpleTypingState state)
 {
     /* TODO: find channel_id, POST /channels/{id}/typing */
-    (void)gc; (void)name;
+    (void)gc; (void)name; (void)state;
+    return 0;
 }
 
 /* ─── Status/presence ─────────────────────────────────────────────────── */
@@ -1486,7 +1547,13 @@ fluxer_plugin_unload(PurplePlugin *plugin)
     return TRUE;
 }
 
-static PurplePluginInfo plugin_info = {
+static void
+fluxer_plugin_init(PurplePlugin *plugin)
+{
+    (void)plugin;
+}
+
+static PurplePluginInfo info = {
     PURPLE_PLUGIN_MAGIC,
     PURPLE_MAJOR_VERSION,
     PURPLE_MINOR_VERSION,
@@ -1517,4 +1584,4 @@ static PurplePluginInfo plugin_info = {
     NULL, NULL, NULL, NULL
 };
 
-PURPLE_INIT_PLUGIN(fluxer, plugin_info, {})
+PURPLE_INIT_PLUGIN(fluxer, fluxer_plugin_init, info)

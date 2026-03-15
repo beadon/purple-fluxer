@@ -7,8 +7,8 @@ PLUGIN_SO    = $(PLUGIN_ID).so
 CC           = gcc
 CFLAGS       = -O2 -Wall -Wextra -g -fPIC \
                $(shell pkg-config --cflags purple json-glib-1.0 glib-2.0)
-LDFLAGS      = -shared \
-               $(shell pkg-config --libs purple json-glib-1.0 glib-2.0)
+LDSOFLAGS    = -shared
+LDLIBS       = $(shell pkg-config --libs purple json-glib-1.0 glib-2.0)
 
 SRCS         = purple-fluxer.c
 OBJS         = $(SRCS:.c=.o)
@@ -22,7 +22,7 @@ USER_PLUGINDIR   = $(HOME)/.purple/plugins
 all: $(PLUGIN_SO)
 
 $(PLUGIN_SO): $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDSOFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
