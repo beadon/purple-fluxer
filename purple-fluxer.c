@@ -1690,12 +1690,30 @@ fluxer_got_open_dm_cb(FluxerData *fd, const gchar *body, gpointer user_data)
     SendImData *sid = user_data;
 
     JsonObject *root = string_to_json_object(body);
-    if (!root) { g_free(sid->who); g_free(sid->message); g_free(sid); return; }
+    if (!root) { g_free(sid->who); g_free(sid->uid); g_free(sid->message); g_free(sid); return; }
+
+    /* Error response — report to user and bail */
+    if (json_object_has_member(root, "code")) {
+        const gchar *errmsg = json_object_has_member(root, "message")
+            ? json_object_get_string_member(root, "message")
+            : "Could not open DM channel";
+        purple_notify_error(fd->gc, "Fluxer", errmsg, NULL);
+        purple_debug_warning("fluxer", "open DM for %s failed: %s\n",
+                             sid->who, errmsg);
+        json_object_unref(root);
+        g_free(sid->who); g_free(sid->uid); g_free(sid->message); g_free(sid);
+        return;
+    }
 
     const gchar *ch_id = json_object_get_string_member(root, "id");
+    if (!ch_id) {
+        json_object_unref(root);
+        g_free(sid->who); g_free(sid->uid); g_free(sid->message); g_free(sid);
+        return;
+    }
 
     /* Cache so future sends go direct without re-opening */
-    if (sid->uid && ch_id)
+    if (sid->uid)
         g_hash_table_insert(fd->dm_channels,
                             g_strdup(sid->uid), g_strdup(ch_id));
 
