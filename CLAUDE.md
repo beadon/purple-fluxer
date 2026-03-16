@@ -220,6 +220,8 @@ Features not yet implemented (contributions welcome):
 - **DM history on login** — implemented: user-configurable dropdown (`dm_history_mode`: auto/open/off). `auto` fetches history when IM window opens via `conversation-created` signal; `open` fetches all unread DMs at READY time. Deduped via `dm_history_fetched` hash.
 - **Friend requests** — READY payload `relationships` array contains pending requests (type values map to friend/pending/blocked). Need incoming request notification + accept/deny UI (likely via `purple_request_action`)
 - **Open DMs persistence** — `private_channels` in READY represents the user's persistent DM list. Should restore open DM conversations across sessions and show unread indicators on buddy entries
+- **History fetch max_len for JSON** — `fluxer_http_request` passes `-1` (defaults to 512 KB) for all fetches including message history. Fine for typical history payloads but will silently truncate if 50 messages contain large embeds/content. Consider passing an explicit limit (e.g. 4 MB) for history fetches the same way image fetches use 10 MB.
+- **Token expiry UX** — when the web client session is invalidated, the gateway sends WS CLOSE with a 4xxx code (4004 = auth failed, 4006 = session invalidated). The plugin currently shows a generic "Gateway closed connection" error. Should detect these specific close codes and show "Session expired — reconnect to refresh token" with instructions to re-enter credentials.
 - **Slash commands** — extend `fluxer_handle_slash_cmd` with the following guild/channel operations:
   - `/nick <new_nickname>` — PATCH `/guilds/{guild_id}/members/@me` with `nick` field
   - `/kick <username>` — DELETE `/guilds/{guild_id}/members/{user_id}`
