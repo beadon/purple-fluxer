@@ -793,18 +793,27 @@ handle_ready(FluxerData *fd, JsonObject *d)
     JsonObject *user = json_object_get_object_member(d, "user");
     const gchar *id  = json_object_get_string_member(user, "id");
     const gchar *uname = json_object_get_string_member(user, "username");
+    const gchar *self_discr = json_object_has_member(user, "discriminator")
+                            ? json_object_get_string_member(user, "discriminator")
+                            : NULL;
 
     g_free(fd->self_user_id);
     g_free(fd->self_username);
     fd->self_user_id  = g_strdup(id);
-    fd->self_username = g_strdup(uname);
+    fd->self_username = g_strdup(uname);  /* plain username — used for routing */
 
     /* purple_conv_im_write(im, NULL, …) calls purple_account_get_name_for_display
      * which checks connection display name before falling back to the login email.
-     * Setting it here makes DM auto-echoes show "beadon" not the email address.
-     * Guild chat sender display is unaffected (OPT_PROTO_UNIQUE_CHATNAME takes
-     * precedence for chats). */
-    purple_connection_set_display_name(fd->gc, uname);
+     * Show username#discriminator when the account has a non-trivial discriminator
+     * (i.e. not the modern "0000" placeholder). */
+    if (self_discr && g_strcmp0(self_discr, "0000") != 0 &&
+        g_strcmp0(self_discr, "") != 0) {
+        gchar *display = g_strdup_printf("%s#%s", uname, self_discr);
+        purple_connection_set_display_name(fd->gc, display);
+        g_free(display);
+    } else {
+        purple_connection_set_display_name(fd->gc, uname);
+    }
 
     g_free(fd->session_id);
     fd->session_id = g_strdup(
@@ -854,8 +863,11 @@ handle_ready(FluxerData *fd, JsonObject *d)
                 JsonArray *recs = json_object_get_array_member(ch, "recipients");
                 if (json_array_get_length(recs) > 0) {
                     JsonObject *r = json_array_get_object_element(recs, 0);
-                    const gchar *uid = json_object_get_string_member(r, "id");
-                    const gchar *un  = json_object_get_string_member(r, "username");
+                    const gchar *uid   = json_object_get_string_member(r, "id");
+                    const gchar *un    = json_object_get_string_member(r, "username");
+                    const gchar *discr = json_object_has_member(r, "discriminator")
+                                       ? json_object_get_string_member(r, "discriminator")
+                                       : NULL;
                     /* "bot": true is the correct signal for system/bot accounts.
                      * Discriminator "0000" is no longer reliable — modern
                      * Fluxer/Discord accounts all carry "0000" since per-user
@@ -909,6 +921,15 @@ handle_ready(FluxerData *fd, JsonObject *d)
                     /* Store uid as protocol data so fluxer_uid_for_buddy's
                      * buddy-data fallback also works for DM contacts. */
                     purple_buddy_set_protocol_data(buddy, g_strdup(uid));
+                    /* Set display alias to username#discriminator when the
+                     * account has a non-trivial discriminator (i.e. not the
+                     * modern "0000" placeholder that all accounts carry). */
+                    if (discr && g_strcmp0(discr, "0000") != 0 &&
+                        g_strcmp0(discr, "") != 0) {
+                        gchar *alias = g_strdup_printf("%s#%s", un, discr);
+                        purple_blist_alias_buddy(buddy, alias);
+                        g_free(alias);
+                    }
                     purple_prpl_got_user_status(fd->account, un, "online", NULL);
                 }
             }
