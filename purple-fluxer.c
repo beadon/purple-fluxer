@@ -565,16 +565,19 @@ ws_process_recv_buf(FluxerData *fd)
 
             case OP_INVALID_SESSION: {
                 gboolean resumable = json_object_get_boolean_member(root, "d");
-                if (!resumable) {
-                    g_free(fd->session_id);
-                    fd->session_id = NULL;
-                }
                 purple_debug_warning("fluxer",
-                    "Invalid session (resumable=%d)\n", resumable);
-                /* Re-identify after brief pause */
-                g_usleep(1000000);
-                fluxer_gateway_send_identify(fd);
-                break;
+                    "Invalid session (resumable=%d) — reconnecting\n",
+                    resumable);
+                /* Clear session so reconnect does a fresh IDENTIFY.
+                 * Do NOT call g_usleep or re-identify inline here:
+                 * we are inside an SSL read callback and the server may
+                 * immediately close the connection in response. */
+                g_free(fd->session_id);
+                fd->session_id = NULL;
+                purple_connection_error_reason(fd->gc,
+                    PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
+                    "Session invalidated — reconnecting");
+                return;  /* fd may be freed; do not touch it */
             }
 
             case OP_DISPATCH: {
@@ -2072,7 +2075,10 @@ static void
 fluxer_ssl_error_cb(PurpleSslConnection *ssl, PurpleSslErrorType error,
                     gpointer data)
 {
+    (void)ssl;
     FluxerData *fd = data;
+    /* Guard against being called after fluxer_close already freed fd */
+    if (!purple_connection_get_protocol_data(fd->gc)) return;
     purple_connection_ssl_error(fd->gc, error);
 }
 
@@ -2994,6 +3000,7 @@ static void
 fluxer_join_chat(PurpleConnection *gc, GHashTable *components)
 {
     FluxerData *fd = purple_connection_get_protocol_data(gc);
+    if (!fd) return;
     const gchar *channel_id = g_hash_table_lookup(components, "channel_id");
     if (!channel_id) return;
 
