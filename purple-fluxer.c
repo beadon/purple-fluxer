@@ -53,6 +53,12 @@
 #define FLUXER_GATEWAY_PATH   "/?v=1&encoding=json"
 #define FLUXER_USER_AGENT     "purple-fluxer/" FLUXER_PLUGIN_VERSION " (libpurple)"
 
+/* Connection progress steps for purple_connection_update_progress */
+#define FLUXER_CONN_STEPS         3
+#define FLUXER_CONN_STEP_AUTH     0   /* Authenticating / using stored token */
+#define FLUXER_CONN_STEP_GATEWAY  1   /* Connecting to gateway WebSocket */
+#define FLUXER_CONN_STEP_READY    2   /* READY received — fully connected */
+
 /* ─── Gateway opcodes (Discord-compatible) ────────────────────────────── */
 
 #define OP_DISPATCH           0
@@ -120,6 +126,9 @@ typedef struct {
     guint    hb_timer;
     gboolean hb_ack_received;
     gboolean ws_closing;    /* TRUE once we've started teardown — prevents double-CLOSE */
+    gboolean dm_signal_connected; /* TRUE when conversation-created signal is connected */
+    gboolean captcha_pending; /* TRUE while browser/dialog is open — suppresses re-trigger */
+    GHashTable *system_users; /* user_id (str) -> 1: "bot":true system/bot accounts */
     gint     sequence;      /* last s value from dispatch, -1 = none */
 
     /* Session (for RESUME) */
@@ -189,7 +198,7 @@ fluxer_data_new(PurpleConnection *gc)
     fd->channel_names    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->guild_names      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->dm_channels      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-    fd->chat_id_map      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    fd->chat_id_map      = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     fd->seeded_channels  = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     fd->user_names       = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
     fd->oldest_msg_id    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
@@ -198,6 +207,7 @@ fluxer_data_new(PurpleConnection *gc)
     fd->guild_members    = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                free_string_list);
     fd->dm_history_fetched = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    fd->system_users     = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     fd->next_chat_id     = 1;
     return fd;
 }
@@ -233,6 +243,7 @@ fluxer_data_free(FluxerData *fd)
     g_hash_table_destroy(fd->channel_last_msg);
     g_hash_table_destroy(fd->guild_members);
     g_hash_table_destroy(fd->dm_history_fetched);
+    g_hash_table_destroy(fd->system_users);
 
     g_free(fd->api_base);
     g_free(fd->token);
@@ -592,7 +603,12 @@ ws_process_recv_buf(FluxerData *fd)
 
             case OP_DISPATCH: {
                 const gchar *t = json_object_get_string_member(root, "t");
-                JsonObject  *d = json_object_get_object_member(root, "d");
+                /* "d" is usually an object, but some events (e.g. SESSIONS_REPLACE)
+                 * send "d" as a JSON array.  Only extract as an object when it
+                 * actually holds one — pass NULL otherwise so handlers can guard. */
+                JsonNode   *d_node = json_object_get_member(root, "d");
+                JsonObject *d = (d_node && JSON_NODE_HOLDS_OBJECT(d_node))
+                                ? json_node_get_object(d_node) : NULL;
                 fluxer_handle_dispatch(fd, t, d);
                 break;
             }
@@ -840,18 +856,60 @@ handle_ready(FluxerData *fd, JsonObject *d)
                     JsonObject *r = json_array_get_object_element(recs, 0);
                     const gchar *uid = json_object_get_string_member(r, "id");
                     const gchar *un  = json_object_get_string_member(r, "username");
+                    /* "bot": true is the correct signal for system/bot accounts.
+                     * Discriminator "0000" is no longer reliable — modern
+                     * Fluxer/Discord accounts all carry "0000" since per-user
+                     * discriminators were removed from the platform. */
+                    gboolean is_bot = json_object_has_member(r, "bot") &&
+                                      json_object_get_boolean_member(r, "bot");
+                    if (is_bot)
+                        g_hash_table_insert(fd->system_users,
+                                            g_strdup(uid), GINT_TO_POINTER(1));
                     /* Map user_id -> channel_id */
                     g_hash_table_insert(fd->dm_channels,
                                         g_strdup(uid), g_strdup(ch_id));
-                    /* Add to buddy list */
-                    PurpleBuddy *buddy =
-                        purple_find_buddy(fd->account, un);
+                    /* Register in user_names so fluxer_uid_for_buddy can find
+                     * DM-only contacts (they are not guild members). */
+                    g_hash_table_insert(fd->user_names,
+                                        g_strdup(uid), g_strdup(un));
+                    /* Add to buddy list — system/bot accounts go in "Fluxer System"
+                     * so they are visually separated and don't mix with system
+                     * accounts from other protocols the user may have connected. */
+                    PurpleGroup *target_group = NULL;
+                    if (is_bot) {
+                        target_group = purple_find_group("Fluxer System");
+                        if (!target_group) {
+                            target_group = purple_group_new("Fluxer System");
+                            purple_blist_add_group(target_group, NULL);
+                        }
+                    }
+                    PurpleBuddy *buddy = purple_find_buddy(fd->account, un);
                     if (!buddy) {
                         buddy = purple_buddy_new(fd->account, un, un);
-                        purple_blist_add_buddy(buddy, NULL, NULL, NULL);
+                        purple_blist_add_buddy(buddy, NULL, target_group, NULL);
+                    } else {
+                        const gchar *cur_group = purple_group_get_name(
+                                                     purple_buddy_get_group(buddy));
+                        if (is_bot &&
+                            g_strcmp0(cur_group, "Fluxer System") != 0) {
+                            /* Move bot into correct group */
+                            purple_blist_add_buddy(buddy, NULL, target_group, NULL);
+                        } else if (!is_bot &&
+                                   (g_strcmp0(cur_group, "Fluxer System") == 0 ||
+                                    g_strcmp0(cur_group, "System") == 0)) {
+                            /* Move regular user out of system group (left over from
+                             * old discriminator-based misclassification) */
+                            PurpleGroup *old_group = purple_buddy_get_group(buddy);
+                            purple_blist_add_buddy(buddy, NULL, NULL, NULL);
+                            if (old_group &&
+                                purple_blist_get_group_size(old_group, FALSE) == 0)
+                                purple_blist_remove_group(old_group);
+                        }
                     }
-                    purple_prpl_got_user_status(fd->account, un,
-                        "online", NULL);
+                    /* Store uid as protocol data so fluxer_uid_for_buddy's
+                     * buddy-data fallback also works for DM contacts. */
+                    purple_buddy_set_protocol_data(buddy, g_strdup(uid));
+                    purple_prpl_got_user_status(fd->account, un, "online", NULL);
                 }
             }
         }
@@ -917,6 +975,7 @@ handle_ready(FluxerData *fd, JsonObject *d)
         purple_signal_connect(purple_conversations_get_handle(),
                               "conversation-created", fd->gc,
                               PURPLE_CALLBACK(fluxer_conversation_created_cb), fd);
+        fd->dm_signal_connected = TRUE;
         /* Also catch any IM windows that Pidgin restored before READY was processed */
         for (GList *l = purple_get_conversations(); l; l = l->next)
             fluxer_conversation_created_cb((PurpleConversation *)l->data, fd);
@@ -926,7 +985,8 @@ handle_ready(FluxerData *fd, JsonObject *d)
     /* "off": do nothing — user can use /more manually */
 
     purple_connection_set_state(fd->gc, PURPLE_CONNECTED);
-    purple_connection_update_progress(fd->gc, "Connected", 3, 3);
+    purple_connection_update_progress(fd->gc, "Connected",
+                                      FLUXER_CONN_STEP_READY, FLUXER_CONN_STEPS);
 }
 
 /* Convert Pidgin's outgoing HTML (produced by GtkIMHtml when
@@ -1892,8 +1952,12 @@ handle_guild_create(FluxerData *fd, JsonObject *d)
             JsonObject *user = json_object_has_member(m, "user")
                              ? json_object_get_object_member(m, "user") : NULL;
             if (!user) continue;
-            const gchar *uname = json_object_get_string_member(user, "username");
-            const gchar *uid   = json_object_get_string_member(user, "id");
+            /* READY guild member objects may be stripped (only "id", no "username");
+             * guard both reads to avoid json-glib assertion failures. */
+            const gchar *uid   = json_object_has_member(user, "id")
+                               ? json_object_get_string_member(user, "id") : NULL;
+            const gchar *uname = json_object_has_member(user, "username")
+                               ? json_object_get_string_member(user, "username") : NULL;
             if (uname && uid) {
                 member_list = g_list_prepend(member_list, g_strdup(uname));
                 g_hash_table_insert(fd->user_names, g_strdup(uid), g_strdup(uname));
@@ -2129,7 +2193,7 @@ fluxer_ssl_connected_cb(gpointer data, PurpleSslConnection *ssl,
     purple_ssl_input_add(ssl, fluxer_ssl_recv_cb, fd);
     purple_debug_info("fluxer", "WebSocket upgrade sent to %s\n", fd->ws_host);
     purple_connection_update_progress(fd->gc, "Authenticating with gateway",
-                                      2, 3);
+                                      FLUXER_CONN_STEP_READY, FLUXER_CONN_STEPS);
 }
 
 static void
@@ -2348,7 +2412,8 @@ fluxer_use_token(FluxerData *fd)
 {
     purple_debug_info("fluxer", "Connecting to gateway %s:%d\n",
                       FLUXER_GATEWAY_HOST, FLUXER_GATEWAY_PORT);
-    purple_connection_update_progress(fd->gc, "Connecting to gateway", 1, 3);
+    purple_connection_update_progress(fd->gc, "Connecting to gateway",
+                                      FLUXER_CONN_STEP_GATEWAY, FLUXER_CONN_STEPS);
     fd->ws_host = g_strdup(FLUXER_GATEWAY_HOST);
     fd->ws_port = FLUXER_GATEWAY_PORT;
     fluxer_ws_connect(fd);
@@ -2367,6 +2432,8 @@ static void
 fluxer_captcha_cancel(gpointer user_data)
 {
     PurpleConnection *gc = (PurpleConnection *)user_data;
+    FluxerData *fd = purple_connection_get_protocol_data(gc);
+    if (fd) fd->captcha_pending = FALSE;
     purple_connection_error_reason(gc,
         PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
         "Login cancelled.");
@@ -2378,6 +2445,8 @@ fluxer_captcha_got_token(gpointer user_data, const gchar *token)
     PurpleConnection *gc = (PurpleConnection *)user_data;
     FluxerData *fd = purple_connection_get_protocol_data(gc);
     if (!fd) return;
+
+    if (fd) fd->captcha_pending = FALSE;
 
     if (!token || !*token) {
         purple_connection_error_reason(gc,
@@ -2427,6 +2496,18 @@ fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
          * paste the resulting session token back into a dialog.  The token
          * is then saved so subsequent logins are fully automatic. */
         if (g_strcmp0(code, "CAPTCHA_REQUIRED") == 0) {
+            /* If a browser window and dialog are already open from a prior
+             * attempt, don't spawn another browser tab or stack a second
+             * dialog on top — just wait for the user to respond to the
+             * existing one.  autorecon can re-trigger this path on retry. */
+            if (fd->captcha_pending) {
+                purple_debug_info("fluxer",
+                    "CAPTCHA dialog already open — suppressing duplicate\n");
+                json_object_unref(root);
+                return;
+            }
+            fd->captcha_pending = TRUE;
+
             /* Open the login page in the system browser.
              * Use g_spawn_async with G_SPAWN_STDOUT_TO_DEV_NULL |
              * G_SPAWN_STDERR_TO_DEV_NULL so the child does NOT inherit
@@ -2458,8 +2539,8 @@ fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
                 "3. Go to Application \xe2\x86\x92 Local Storage "
                     "\xe2\x86\x92 https://fluxer.app\n"
                 "4. Copy the value of the \"token\" key.\n\n"
-                "Paste your token below. It will be saved so you "
-                "won't need to do this again.",
+                "Paste your token below (it starts with \"flx_\"). "
+                "It will be saved so you won't need to do this again.",
                 NULL,   /* default value */
                 FALSE,  /* not multiline */
                 FALSE,  /* not masked — token is long, user should verify paste */
@@ -2505,7 +2586,8 @@ fluxer_login(PurpleAccount *account)
     /* Tell libpurple/Pidgin we send and receive HTML so formatting is rendered. */
     gc->flags |= PURPLE_CONNECTION_HTML;
 
-    purple_connection_update_progress(gc, "Connecting", 0, 3);
+    purple_connection_update_progress(gc, "Connecting",
+                                      FLUXER_CONN_STEP_AUTH, FLUXER_CONN_STEPS);
 
     /* Prefer an explicitly stored token (e.g., bot token or saved session) */
     const gchar *stored_token =
@@ -2537,7 +2619,8 @@ fluxer_login(PurpleAccount *account)
     json_object_unref(body_obj);
 
     gchar *url = g_strdup_printf("%s/auth/login", fd->api_base);
-    purple_connection_update_progress(gc, "Authenticating", 0, 3);
+    purple_connection_update_progress(gc, "Authenticating",
+                                      FLUXER_CONN_STEP_AUTH, FLUXER_CONN_STEPS);
     fluxer_http_request(fd, "POST", url, body_str,
                         fluxer_got_login_response, NULL);
     g_free(url);
@@ -2550,10 +2633,16 @@ fluxer_close(PurpleConnection *gc)
     FluxerData *fd = purple_connection_get_protocol_data(gc);
     if (!fd) return;
 
-    /* Disconnect conversation-created signal if connected (auto DM history mode) */
-    purple_signal_disconnect(purple_conversations_get_handle(),
-                             "conversation-created", gc,
-                             PURPLE_CALLBACK(fluxer_conversation_created_cb));
+    /* Disconnect conversation-created signal only if it was actually connected
+     * (signal is only connected when READY is processed in auto DM history mode;
+     * if teardown happens before READY — e.g. a 4004 before READY — the signal
+     * was never registered and purple_signal_disconnect would assert). */
+    if (fd->dm_signal_connected) {
+        purple_signal_disconnect(purple_conversations_get_handle(),
+                                 "conversation-created", gc,
+                                 PURPLE_CALLBACK(fluxer_conversation_created_cb));
+        fd->dm_signal_connected = FALSE;
+    }
 
     /* Send WS close frame */
     if (fd->ssl && fd->ws_handshake_done) {
@@ -2692,6 +2781,16 @@ fluxer_send_im(PurpleConnection *gc, const gchar *who,
         /* Return 0: suppress libpurple's IM auto-echo (which would show raw
          * markdown and the email sender name). The gateway MESSAGE_CREATE echo
          * with channel_type=999 delivers the formatted message via serv_got_im. */
+        return 0;
+    }
+
+    /* Block messages to system accounts (discriminator "0000").
+     * Look up by user_id — more reliable than checking the blist group name. */
+    const gchar *send_uid = fluxer_uid_for_buddy(fd, who);
+    if (send_uid && g_hash_table_contains(fd->system_users, send_uid)) {
+        purple_notify_error(gc, "Fluxer",
+            "Cannot send message",
+            "This is a system account — replies are not supported.");
         return 0;
     }
 

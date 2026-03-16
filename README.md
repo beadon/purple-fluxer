@@ -181,6 +181,11 @@ contribution targets:
    support a per-server nickname distinct from the global username. libpurple
    buddies have a single global alias; `get_cb_alias` has no room/guild context
    parameter, so per-guild overrides cannot be implemented at the plugin level.
+8. **Pending-send delivery indicator** — The web client greys out an outgoing
+   message until the server acknowledges it, then renders it normally. libpurple
+   has no `PURPLE_MESSAGE_PENDING` flag and no API to update the visual state of
+   an already-displayed message. Messages appear immediately as sent with no
+   delivery feedback.
 
 ---
 
