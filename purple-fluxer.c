@@ -462,11 +462,36 @@ ws_process_recv_buf(FluxerData *fd)
                            |  (guint8)buf->str[offset + 1];
             purple_debug_info("fluxer",
                 "WebSocket CLOSE received (code=%u)\n", close_code);
-            /* Attempt reconnect */
-            purple_connection_error_reason(fd->gc,
-                PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
-                "Gateway closed connection");
-            g_string_erase(buf, 0, header_size + payload_len);
+
+            if (close_code == 4004 || close_code == 4006) {
+                /* Session token invalidated (e.g. logged out of web client).
+                 * Clear the stored token so the next connect attempt falls
+                 * through to email+password login (which already handles
+                 * the CAPTCHA flow if the server requires it). */
+                purple_debug_info("fluxer",
+                    "Session invalidated (code=%u) — clearing stored token\n",
+                    close_code);
+                purple_account_set_string(fd->account, "token", "");
+                const gchar *password =
+                    purple_account_get_password(fd->account);
+                if (password && *password) {
+                    /* Credentials available — Pidgin will auto-reconnect and
+                     * fluxer_login will re-authenticate with email+password. */
+                    purple_connection_error_reason(fd->gc,
+                        PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
+                        "Session expired — reconnecting with password");
+                } else {
+                    purple_connection_error_reason(fd->gc,
+                        PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED,
+                        "Session expired — re-enter your password in "
+                        "Account Settings");
+                }
+            } else {
+                purple_connection_error_reason(fd->gc,
+                    PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
+                    "Gateway closed connection");
+            }
+            /* Do NOT touch fd or buf after error_reason — fd is freed. */
             return;
         }
 
