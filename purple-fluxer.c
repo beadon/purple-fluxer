@@ -44,7 +44,7 @@
 /* ─── Plugin constants ────────────────────────────────────────────────── */
 
 #define FLUXER_PLUGIN_ID      "prpl-fluxer"
-#define FLUXER_PLUGIN_VERSION "0.1.0"
+#define FLUXER_PLUGIN_VERSION "0.2.0"
 #define FLUXER_PRPL_PROTOCOL  "fluxer"
 
 #define FLUXER_API_BASE       "https://web.fluxer.app/api/v1"

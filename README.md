@@ -8,12 +8,14 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 
 ---
 
-## What works (v0.1)
+## What works (v0.2)
 
 | Feature | Status |
 |---|---|
 | Email/password login | ✅ |
 | Token-based login (bot or stored session) | ✅ |
+| CAPTCHA challenge flow (first login from new client) | ✅ |
+| Auto re-login on session expiry (WS close 4004/4006) | ✅ |
 | Gateway WebSocket connect + IDENTIFY | ✅ |
 | Heartbeat keepalive (with op:1 server-request handling) | ✅ |
 | Session RESUME on reconnect | ✅ |
@@ -23,6 +25,7 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Send guild channel messages | ✅ |
 | Guild/category/channel buddy list hierarchy | ✅ (as "Guild / Category" groups) |
 | Channel history on open (last 50 messages) | ✅ |
+| DM history loaded automatically on login | ✅ |
 | `/more` command — paginate older history | ✅ |
 | Message edit notifications (`MESSAGE_UPDATE`) | ✅ |
 | Message delete notifications (`MESSAGE_DELETE`) | ✅ |
@@ -35,18 +38,53 @@ a free, open-source, self-hostable Discord-compatible instant messaging platform
 | Personal notes channel (type 999) | ✅ |
 | Correct sender name in guild chat | ✅ (`OPT_PROTO_UNIQUE_CHATNAME`) |
 | Markdown rendering (bold/italic/code/strikethrough/underline/spoiler) | ✅ (incoming + outgoing round-trip) |
-| Mention resolution (`<@id>` → username, `<#id>` → channel) | ❌ (TODO) |
-| `@mention` tab highlight (`PURPLE_MESSAGE_NICK`) | ❌ (TODO — implement alongside mention resolution) |
+| Inline image / GIF rendering (receive side) | ✅ (clickable link + `<img>` tag) |
+| Mention resolution (`<@id>` → username, `<#id>` → channel) | ✅ |
+| `@mention` tab highlight (`PURPLE_MESSAGE_NICK`) | ✅ |
 | Unread indicator on buddy list for closed channels | ✅ (notice shown on open; blist bolding needs upstream Pidgin — see Known Limitations) |
-| Message reply context | ❌ (TODO) |
-| File attachments (links + inline images) | ❌ (TODO) |
-| Buddy avatars | ❌ (TODO) |
 | Typing indicator send | ✅ (DMs only — no guild chat typing API in libpurple 2.x) |
 | Typing indicator receive | ✅ (DMs only — same limitation) |
+| System/bot account detection (`"bot": true`) | ✅ (placed in "Fluxer System" group; send blocked) |
+| Own username#discriminator display | ✅ (shown in connection display name when non-trivial) |
+| Message reply context | ❌ (TODO) |
+| File attachments (send) | ❌ (TODO) |
+| Buddy avatars | ❌ (TODO) |
 | `GUILD_MEMBER_ADD` / `GUILD_MEMBER_REMOVE` live updates | ❌ (TODO) |
 | Reactions display | ❌ (TODO) |
 | MFA / TOTP login | ❌ (TODO) |
 | Voice/video | ❌ (out of scope for libpurple) |
+
+---
+
+## Changelog
+
+### v0.2.0
+
+- **CAPTCHA challenge flow** — first login from a new client opens Fluxer in
+  the browser and prompts for the session token; token is saved for all future
+  logins. Duplicate dialogs on autorecon retry are suppressed.
+- **Auto re-login on session expiry** — WS close codes 4004 and 4006 trigger
+  a clean re-authentication instead of a hard disconnect.
+- **DM history on login** — last 50 messages loaded automatically when a DM
+  window is opened after connecting.
+- **Inline image / GIF rendering** — image attachments are rendered as
+  clickable links with an `<img>` tag when the URL ends in a known image
+  extension.
+- **Mention resolution** — `<@user_id>` and `<#channel_id>` tokens in
+  incoming messages are resolved to display names. Messages containing your
+  own username or `@everyone` set `PURPLE_MESSAGE_NICK` for tab highlighting.
+- **Outgoing markdown** — messages typed in Pidgin's HTML input are converted
+  to Discord markdown dialect before sending (bold, italic, strikethrough,
+  inline code, code blocks, spoilers).
+- **System/bot account handling** — accounts with `"bot": true` are placed in
+  a dedicated "Fluxer System" buddy group and outbound messages to them are
+  blocked with an error dialog.
+- **Own discriminator display** — connection display name shows
+  `username#discriminator` when the account has a non-trivial discriminator.
+- **Stability fixes** — fixed crash on `chat_id_map` free (GINT_TO_POINTER
+  values), fixed assertion on `SESSIONS_REPLACE` (array `d` field), fixed
+  crash when disconnect races signal registration, suppressed libpurple
+  `free(0x1)` on reconnect.
 
 ---
 
