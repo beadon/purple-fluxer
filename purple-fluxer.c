@@ -119,6 +119,7 @@ typedef struct {
     guint    hb_interval_ms;
     guint    hb_timer;
     gboolean hb_ack_received;
+    gboolean ws_closing;    /* TRUE once we've started teardown — prevents double-CLOSE */
     gint     sequence;      /* last s value from dispatch, -1 = none */
 
     /* Session (for RESUME) */
@@ -142,9 +143,6 @@ typedef struct {
 
     /* HTTP pending requests (PurpleHttpConnection*) */
     GSList *pending_http;
-
-    /* Login request state (used when email+password flow is in flight) */
-    gboolean login_in_progress;
 
     /* Configurable API base (from account Advanced settings) */
     gchar *api_base;
@@ -361,6 +359,11 @@ fluxer_ssl_recv_cb(gpointer data, PurpleSslConnection *ssl,
                    PurpleInputCondition cond)
 {
     FluxerData *fd = data;
+
+    /* Ignore all further reads once teardown has started — prevents a second
+     * purple_connection_error_reason call from the SSL error path below. */
+    if (fd->ws_closing) return;
+
     guint8 buf[4096];
     int len;
 
@@ -456,6 +459,13 @@ ws_process_recv_buf(FluxerData *fd)
 
         /* Handle control frames inline */
         if (opcode == WS_OP_CLOSE) {
+            if (fd->ws_closing) {
+                /* SSL layer fired a second recv after we already started
+                 * teardown; ignore to prevent double purple_connection_error_reason. */
+                return;
+            }
+            fd->ws_closing = TRUE;
+
             guint16 close_code = 0;
             if (payload_len >= 2)
                 close_code = ((guint8)buf->str[offset] << 8)
@@ -589,7 +599,10 @@ ws_process_recv_buf(FluxerData *fd)
 
             case OP_GATEWAY_ERROR:
                 purple_debug_error("fluxer", "Gateway error from server\n");
-                break;
+                purple_connection_error_reason(fd->gc,
+                    PURPLE_CONNECTION_ERROR_NETWORK_ERROR,
+                    "Gateway error");
+                return;  /* fd may be freed */
 
             default:
                 purple_debug_warning("fluxer",
@@ -2415,12 +2428,19 @@ fluxer_got_login_response(FluxerData *fd, const gchar *body, gpointer user_data)
          * is then saved so subsequent logins are fully automatic. */
         if (g_strcmp0(code, "CAPTCHA_REQUIRED") == 0) {
             /* Open the login page in the system browser.
-             * g_spawn_command_line_async("xdg-open …") is more reliable than
-             * purple_notify_uri which goes through GTK notify ops and can
-             * silently fail depending on the desktop environment. */
+             * Use g_spawn_async with G_SPAWN_STDOUT_TO_DEV_NULL |
+             * G_SPAWN_STDERR_TO_DEV_NULL so the child does NOT inherit
+             * Pidgin's stdout/stderr file descriptors.  Without this,
+             * xdg-open holds the parent's pipe open until it exits (which
+             * can take several seconds), causing the terminal to hang after
+             * Pidgin exits. */
             GError *spawn_err = NULL;
-            if (!g_spawn_command_line_async("xdg-open https://fluxer.app",
-                                            &spawn_err)) {
+            gchar *xdg_argv[] = { "xdg-open", "https://fluxer.app", NULL };
+            if (!g_spawn_async(NULL, xdg_argv, NULL,
+                               G_SPAWN_SEARCH_PATH |
+                               G_SPAWN_STDOUT_TO_DEV_NULL |
+                               G_SPAWN_STDERR_TO_DEV_NULL,
+                               NULL, NULL, NULL, &spawn_err)) {
                 purple_debug_warning("fluxer",
                     "xdg-open failed (%s) — user must open browser manually\n",
                     spawn_err ? spawn_err->message : "unknown");

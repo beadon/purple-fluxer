@@ -61,6 +61,50 @@ fluxer_login()
                                 OP_DISPATCH (0)       → fluxer_handle_dispatch()
 ```
 
+### Session expiry and recovery flow
+
+```
+Normal session loss (web client logout or server kick):
+
+  Server sends op:9 (OP_INVALID_SESSION, resumable=false)
+    └─ ws_process_recv_buf: clear fd->session_id
+       call purple_connection_error_reason(NETWORK_ERROR)
+       return  ← fd may be freed after this
+         └─ Pidgin auto-reconnect fires
+              └─ fluxer_login(): stored token still present
+                   └─ fluxer_use_token() → IDENTIFY with old token
+                        └─ Server sends WS CLOSE(4004) — token was invalidated
+                             └─ ws_process_recv_buf WS_OP_CLOSE handler:
+                                  ws_closing = TRUE  (prevents double-CLOSE)
+                                  purple_account_set_string("token", "")
+                                  if (password stored):
+                                    error_reason(NETWORK_ERROR) → auto-reconnect
+                                  else:
+                                    error_reason(AUTH_FAILED) → user must reconnect
+                                      └─ fluxer_login(): no token, has password
+                                           └─ POST /auth/login
+                                                └─ CAPTCHA_REQUIRED response
+                                                     └─ fluxer_got_login_response:
+                                                          xdg-open https://fluxer.app
+                                                          purple_request_input dialog
+                                                          user pastes token → fluxer_captcha_got_token
+                                                          token stored → fluxer_use_token() → connected
+
+WS CLOSE codes handled:
+  4004 = auth_failed   (token rejected — clear token, fall back to email+password)
+  4006 = session_invalid (same treatment as 4004)
+  other = generic network error → error_reason(NETWORK_ERROR) → auto-reconnect with same token
+
+Double-CLOSE prevention:
+  fd->ws_closing flag — set on first CLOSE frame.
+  fluxer_ssl_recv_cb checks it at entry and returns immediately if set,
+  preventing a second purple_connection_error_reason from the SSL error path.
+
+RESUME: session_id and resume_gateway_url are stored from READY but RESUME
+  (op:6) is not yet sent. op:7 (RECONNECT) triggers a fresh IDENTIFY on
+  reconnect. Implementing RESUME is a TODO.
+```
+
 ### Key gateway events handled
 
 | Event | Handler |
@@ -218,9 +262,19 @@ Features not yet implemented (contributions welcome):
 - **MFA / TOTP login** — 6-digit TOTP code entry after email+password
 - **`@everyone` / `@here` highlight** — add `PURPLE_MESSAGE_NICK` when message contains these strings
 - **DM history on login** — implemented: user-configurable dropdown (`dm_history_mode`: auto/open/off). `auto` fetches history when IM window opens via `conversation-created` signal; `open` fetches all unread DMs at READY time. Deduped via `dm_history_fetched` hash.
+- **User discriminator display** — Fluxer users have a `#NNNN` discriminator suffix (e.g. `beadon#1568`) visible in the web client. The `user` object in READY and member chunks includes a `discriminator` field. This should be stored in `user_names` (or a parallel `user_discriminators` map) and surfaced in Pidgin: at minimum shown in the chat participant tooltip / `get_cb_real_name`, ideally also in the account display name set via `purple_connection_set_display_name` so the user can see their own tag.
 - **Friend requests** — READY payload `relationships` array contains pending requests (type values map to friend/pending/blocked). Need incoming request notification + accept/deny UI (likely via `purple_request_action`)
 - **Open DMs persistence** — `private_channels` in READY represents the user's persistent DM list. Should restore open DM conversations across sessions and show unread indicators on buddy entries
 - **History fetch max_len for JSON** — `fluxer_http_request` passes `-1` (defaults to 512 KB) for all fetches including message history. Fine for typical history payloads but will silently truncate if 50 messages contain large embeds/content. Consider passing an explicit limit (e.g. 4 MB) for history fetches the same way image fetches use 10 MB.
+- **Handoff login flow (replaces CAPTCHA browser workaround)** — Fluxer implements an `AUTH_HANDOFF` API that allows a native client to get a token from an already-authenticated web session, bypassing CAPTCHA entirely. All three plugin-facing endpoints are `skipAuth: true` (no Authorization header needed).
+  **Flow:**
+  1. Plugin: `POST /auth/handoff/initiate` (no auth, no body) → `{code: "<uuid-string>"}` — strip dashes, display first 12 hex chars as two groups of 6: e.g. `A1B2C3 D4E5F6`
+  2. Plugin shows a Pidgin dialog: "Your code is ready! Enter this code in the Fluxer web client: **A1B2C3 D4E5F6**"
+  3. User opens `https://web.fluxer.app/login?desktop_handoff=1` in their browser → enters the code → web client calls `POST /auth/handoff/complete` with `{code, token, user_id}`
+  4. Plugin polls `GET /auth/handoff/{code}/status` (e.g. every 2s) → response: `{status: "completed"|"pending"|"expired", token: "flx_...", user_id: "..."}`
+  5. On `status == "completed"`: store token → connect gateway. On `status == "expired"` or timeout: fall back to existing CAPTCHA browser flow.
+  **When to use:** Try handoff first on any fresh login (before email+password, which always triggers CAPTCHA). The existing CAPTCHA dialog remains the fallback. This eliminates the developer-tools token-copy requirement entirely.
+  **Source confirmed from:** `ed64a32baf3d7010.js` (CAPTCHA bundle) and `4ad3f9a6a67c9e74.js` (main bundle) — functions `R()`, `L()`, `B()`, `U()` in the auth/handoff module. Status body shape confirmed: `{status, token, user_id}` from the desktop app's `consumeDesktopHandoffCode` bootstrap path.
 - **Token expiry — automatic re-login on 4004/4006** — when the gateway sends WS CLOSE with code 4004 (auth failed) or 4006 (session invalidated), the plugin should automatically re-POST to `POST /auth/login` using the stored email+password (already in Pidgin account settings). On success, store the new token and reconnect — user sees nothing. If CAPTCHA is required (server returns `captcha_key`), fall through to the existing CAPTCHA browser flow. If only a token is stored (no password), show a clear error: "Session expired — re-enter your password in Account Settings → Password".
 - **Token expiry — OAuth2 refresh token (future)** — Fluxer's `/oauth2/token` endpoint supports `grant_type=refresh_token` which would allow silent token renewal without re-entering credentials. However, the Fluxer Applications developer portal (Developer → Applications) currently cannot reveal or regenerate the client_secret or bot token (broken feature as of 2026-03-15). Revisit once Fluxer fixes application credential management. Implementation would add `Client ID` + `Client Secret` fields to Advanced settings, use the OOB authorization code flow on first connect, then silently refresh on 4004/4006.
 - **Slash commands** — extend `fluxer_handle_slash_cmd` with the following guild/channel operations:
