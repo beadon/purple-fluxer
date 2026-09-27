@@ -224,8 +224,8 @@ fluxer_data_free(FluxerData *fd)
         purple_ssl_close(fd->ssl);
 
     /* Cancel any pending HTTP */
-    g_slist_foreach(fd->pending_http,
-                    (GFunc)purple_util_fetch_url_cancel, NULL);
+    for (GSList *l = fd->pending_http; l; l = l->next)
+        purple_util_fetch_url_cancel(l->data);
     g_slist_free(fd->pending_http);
 
     g_string_free(fd->ws_recv_buf, TRUE);
@@ -369,6 +369,7 @@ static void
 fluxer_ssl_recv_cb(gpointer data, PurpleSslConnection *ssl,
                    PurpleInputCondition cond)
 {
+    (void)cond;
     FluxerData *fd = data;
 
     /* Ignore all further reads once teardown has started — prevents a second
@@ -723,7 +724,10 @@ fluxer_gateway_send_identify(FluxerData *fd)
     purple_debug_info("fluxer", "Sent IDENTIFY\n");
 }
 
-static void
+/* Not yet called: every reconnect goes through purple_connection_error_reason,
+ * which frees FluxerData (session_id, sequence) before a RESUME could be sent.
+ * See the RESUME TODO in CLAUDE.md. */
+G_GNUC_UNUSED static void
 fluxer_gateway_send_resume(FluxerData *fd)
 {
     JsonObject *d = json_object_new();
@@ -2184,6 +2188,7 @@ static void
 fluxer_ssl_connected_cb(gpointer data, PurpleSslConnection *ssl,
                         PurpleInputCondition cond)
 {
+    (void)cond;
     FluxerData *fd = data;
 
     /* Send HTTP Upgrade request */
@@ -2379,51 +2384,6 @@ fluxer_http_request(FluxerData *fd, const gchar *method, const gchar *url,
 }
 
 /* ─── Login flow ──────────────────────────────────────────────────────── */
-
-/* Step 3: got gateway URL → open WebSocket */
-static void
-fluxer_got_gateway_url(FluxerData *fd, const gchar *body, gpointer user_data)
-{
-    (void)user_data;
-    JsonObject *root = string_to_json_object(body);
-    if (!root) {
-        purple_connection_error_reason(fd->gc,
-            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
-            "Failed to parse gateway URL");
-        return;
-    }
-
-    const gchar *ws_url = json_object_get_string_member(root, "url");
-    if (!ws_url) {
-        purple_debug_error("fluxer", "Gateway response missing 'url' field: %s\n",
-                           body);
-        purple_connection_error_reason(fd->gc,
-            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
-            "Gateway URL response missing url field");
-        json_object_unref(root);
-        return;
-    }
-    purple_debug_info("fluxer", "Gateway URL: %s\n", ws_url);
-
-    /* Parse "wss://hostname" — strip scheme, extract host */
-    const gchar *host = ws_url;
-    if (g_str_has_prefix(ws_url, "wss://"))
-        host = ws_url + 6;
-    else if (g_str_has_prefix(ws_url, "ws://"))
-        host = ws_url + 5;
-
-    g_free(fd->ws_host);
-    fd->ws_host = g_strdup(host);
-    /* Strip trailing slash or path if any */
-    gchar *slash = strchr(fd->ws_host, '/');
-    if (slash) *slash = '\0';
-
-    fd->ws_port = FLUXER_GATEWAY_PORT;
-
-    json_object_unref(root);
-
-    fluxer_ws_connect(fd);
-}
 
 /* Step 2: logged in, got token → connect to gateway.
  * /gateway/bot is a bot-only endpoint; user accounts connect directly
@@ -2783,6 +2743,7 @@ static int
 fluxer_send_im(PurpleConnection *gc, const gchar *who,
                const gchar *message, PurpleMessageFlags flags)
 {
+    (void)flags;
     FluxerData *fd = purple_connection_get_protocol_data(gc);
 
     /* Personal notes — channel_id == self_user_id, channel_type 999 */
@@ -2867,6 +2828,7 @@ static int
 fluxer_send_chat(PurpleConnection *gc, int id,
                  const gchar *message, PurpleMessageFlags flags)
 {
+    (void)flags;
     FluxerData *fd = purple_connection_get_protocol_data(gc);
 
     /* Reverse-lookup channel_id from chat_id */
@@ -3227,6 +3189,7 @@ fluxer_join_chat(PurpleConnection *gc, GHashTable *components)
 static GList *
 fluxer_status_types(PurpleAccount *account)
 {
+    (void)account;
     GList *types = NULL;
     PurpleStatusType *type;
 
@@ -3437,13 +3400,17 @@ static PurplePluginProtocolInfo prpl_info = {
     NULL,                           /* set_public_alias */
     NULL,                           /* get_public_alias */
     NULL,                           /* add_buddy_with_invite */
-    NULL                            /* add_buddies_with_invite */
+    NULL,                           /* add_buddies_with_invite */
+    NULL,                           /* get_cb_alias */
+    NULL,                           /* chat_can_receive_file */
+    NULL                            /* chat_send_file */
 };
 
 /* Icon name — Pidgin looks for prpl-fluxer.png in its pixmaps dir */
 static const gchar *
 fluxer_list_icon(PurpleAccount *account, PurpleBuddy *buddy)
 {
+    (void)account; (void)buddy;
     return "fluxer";
 }
 
@@ -3504,6 +3471,7 @@ fluxer_cmd_more(PurpleConversation *conv, const gchar *cmd,
 static gboolean
 fluxer_plugin_load(PurplePlugin *plugin)
 {
+    (void)plugin;
     prpl_info.protocol_options = fluxer_account_options();
 
     fluxer_cmd_more_id = purple_cmd_register(
@@ -3519,6 +3487,7 @@ fluxer_plugin_load(PurplePlugin *plugin)
 static gboolean
 fluxer_plugin_unload(PurplePlugin *plugin)
 {
+    (void)plugin;
     if (fluxer_cmd_more_id != 0) {
         purple_cmd_unregister(fluxer_cmd_more_id);
         fluxer_cmd_more_id = 0;
